@@ -22,6 +22,34 @@
 快速和聚焦复审使用 medium reasoning，中型 PR 使用 high，大型 PR 使用 xhigh；父 Agent
 不会读取 patch。
 
+## 性能评测
+
+2026-08-12 使用隔离 Docker 基准环境，对每个工作流分别执行了 3 组 Skill/baseline
+配对评测；模型为 `gpt-5.6-sol`、medium reasoning，镜像为
+`agent-skills-codex-benchmark:0.147.0`。每条 lane 都使用全新的 Codex tmpfs、Gitea
+实例和仓库，并接收完全相同的 PR 元数据与 commit SHA。18 次运行及服务端状态校验全部
+通过。
+
+| Skill | 有效配对 | 平均耗时，Skill / baseline | 耗时 | 输入 Token | 输出 Token | 顶层调用中位数 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `gitea-merge` | 3/3 | 38.5s / 51.2s | -24.8% | -43.6% | -26.4% | 2 / 4 |
+| `gitea-review` | 3/3 | 60.4s / 72.4s | -16.6% | -48.1% | -66.5% | 3* / 9 |
+| `gitea-release` | 3/3 | 44.7s / 76.9s | -41.8% | -60.7% | -51.1% | 3 / 7 |
+
+每轮耗时按 Skill / baseline 展示；负数表示 Skill 更快：
+
+| Skill | 第 1 轮 | 第 2 轮 | 第 3 轮 |
+| --- | ---: | ---: | ---: |
+| `gitea-merge` | 44.7s / 61.8s (-27.7%) | 43.7s / 44.3s (-1.4%) | 27.2s / 47.6s (-42.8%) |
+| `gitea-review` | 55.1s / 104.4s (-47.2%) | 54.7s / 63.0s (-13.0%) | 71.3s / 49.8s (+43.1%) |
+| `gitea-release` | 40.3s / 79.1s (-49.1%) | 47.7s / 72.7s (-34.4%) | 46.2s / 78.8s (-41.3%) |
+
+宿主机只挂载 `auth.json`；Skill lane 额外以只读方式挂载目标 Skill，因此本地记忆与缓存
+已隔离，但服务端 prompt cache 无法禁用：返回的 cached input token 不为零，且已包含在
+上表的 Token 对比中。runner 会随机调整 lane 顺序。`gitea-review` 子 Agent 的内部事件
+不会出现在父 Agent JSONL 中，因此带星号的调用次数只统计顶层事件。复现方法见
+[性能评测说明](tests/benchmark/README.md)。
+
 ## 环境要求
 
 - 支持 [Agent Skills](https://agentskills.io/) 格式的 Agent 运行环境
