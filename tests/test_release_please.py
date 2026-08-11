@@ -34,13 +34,14 @@ class ReleasePleaseConfigurationTests(unittest.TestCase):
             },
         )
 
-    def test_workflow_uses_pat_and_current_action(self) -> None:
+    def test_workflow_uses_github_token_and_current_action(self) -> None:
         workflow = (ROOT / ".github" / "workflows" / "release-please.yml").read_text(
             encoding="utf-8"
         )
 
         self.assertIn("googleapis/release-please-action@v5", workflow)
-        self.assertIn("secrets.RELEASE_PLEASE_TOKEN", workflow)
+        self.assertIn("token: ${{ github.token }}", workflow)
+        self.assertNotIn("RELEASE_PLEASE_TOKEN", workflow)
         self.assertIn("contents: write", workflow)
         self.assertIn("pull-requests: write", workflow)
 

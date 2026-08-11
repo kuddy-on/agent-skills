@@ -68,11 +68,11 @@ request from Conventional Commits, then creates the version tag and GitHub
 Release after that pull request is merged. The `simple` releaser updates
 `version.txt` and `CHANGELOG.md`.
 
-Maintainers must configure a repository Actions secret named
-`RELEASE_PLEASE_TOKEN`. Use a fine-grained PAT or GitHub App token with access
-to this repository and read/write permissions for Contents, Issues, and Pull
-requests. Do not replace it with the default `GITHUB_TOKEN`: token-generated
-pull requests do not trigger the required `unit` and `integration` workflows.
+The workflow uses its job-scoped `github.token`; no separate release secret is
+required. Repository Actions settings must allow GitHub Actions to create and
+approve pull requests. Checks created for a `GITHUB_TOKEN`-authored release
+pull request require a maintainer with write access to approve them before they
+run.
 
 Merge a release pull request only after its required checks pass and all review
 conversations are resolved. Use `fix:`, `feat:`, or a `!`/`BREAKING CHANGE`
