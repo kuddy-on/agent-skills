@@ -17,8 +17,13 @@ on Gitea.
 | `gitea-release` | Merge a Release Please pull request and verify its workflow, tag, and Gitea Release. |
 
 Each skill can be installed and used independently. `gitea-release` does not
-depend on `gitea-merge`. For a merge-and-release workflow, pass the ordinary
-pull request's resulting commit SHA to `gitea-release` as `--after-sha`.
+depend on `gitea-merge` and only operates on an existing Release Please pull
+request.
+
+`gitea-review` classifies PR size from metadata, then delegates the review to
+one reusable worker with no inherited conversation. Fast and focused reviews
+use medium reasoning, medium reviews use high, and large reviews use xhigh;
+the parent does not inspect the patch.
 
 ## Requirements
 
@@ -64,6 +69,15 @@ Python interpreter.
 
 ## Development
 
+Install the development tools, including ShellCheck from the operating system
+package manager, then run format and static checks:
+
+```bash
+python -m pip install --requirement requirements-dev.txt
+go install mvdan.cc/sh/v3/cmd/shfmt@v3.13.1
+scripts/check.sh
+```
+
 Run unit tests:
 
 ```bash
@@ -84,11 +98,13 @@ finishes. It never uses a configured production Gitea account.
 
 ```text
 agent-skills/
+├── scripts/
 ├── skills/
 │   ├── gitea-merge/
 │   ├── gitea-release/
 │   └── gitea-review/
 ├── tests/
+├── AGENTS.md
 ├── CONTRIBUTING.md
 ├── LICENSE
 ├── README.md

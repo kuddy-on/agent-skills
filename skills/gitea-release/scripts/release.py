@@ -19,7 +19,6 @@ RELEASE_TITLE = re.compile(
     r"^chore\((?P<branch>[^)]+)\): release "
     r"(?P<version>\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?)$"
 )
-SHA = re.compile(r"^[0-9a-fA-F]{7,64}$")
 NETWORK_ERRORS = (
     "connection refused",
     "connection reset",
@@ -52,7 +51,6 @@ class Publisher:
         poll_interval: int,
         timeout: int,
         dry_run: bool,
-        after_sha: str | None,
         login: str | None,
     ) -> None:
         self.repo = repo
@@ -62,9 +60,9 @@ class Publisher:
         self.poll_interval = poll_interval
         self.timeout = timeout
         self.dry_run = dry_run
-        self.after_sha = after_sha
         self.requested_login = login
         self.login: str | None = None
+        self.can_force_merge = False
         self.owner: str | None = None
         self.repo_name: str | None = None
         self.repo_slug: str | None = None
@@ -73,12 +71,12 @@ class Publisher:
             "login": None,
             "base": base,
             "workflow": workflow,
-            "after_sha": after_sha,
             "status": "running",
             "dry_run": dry_run,
             "release_pr": None,
             "version": None,
             "workflow_run": None,
+            "force_merge_used": False,
             "warnings": [],
             "stages": [],
         }
@@ -109,16 +107,16 @@ class Publisher:
         return result
 
     def api_for_login(self, endpoint: str, login: str) -> Any:
-        result = self.command(
-            ["tea", "api", "--login", login, endpoint], check=False
-        )
+        result = self.command(["tea", "api", "--login", login, endpoint], check=False)
         if result.returncode:
             detail = result.stderr.strip() or result.stdout.strip()
             raise ReleaseError(f"tea api failed for login {login!r}: {detail}")
         try:
             value = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
-            raise ReleaseError(f"Gitea API returned invalid JSON for {endpoint}") from exc
+            raise ReleaseError(
+                f"Gitea API returned invalid JSON for {endpoint}"
+            ) from exc
         message = str(value.get("message") or "") if isinstance(value, dict) else ""
         if message and is_network_error(message):
             raise NetworkAccessRequired(
@@ -161,7 +159,9 @@ class Publisher:
                 None,
             )
             if selected is None:
-                raise ReleaseError(f"Tea login {self.requested_login!r} is not configured")
+                raise ReleaseError(
+                    f"Tea login {self.requested_login!r} is not configured"
+                )
             if not login_matches_host(selected, host):
                 raise ReleaseError(
                     f"Tea login {self.requested_login!r} does not match origin host {host}"
@@ -192,7 +192,9 @@ class Publisher:
                 continue
             permissions = repository.get("permissions") or {}
             if not (permissions.get("push") or permissions.get("admin")):
-                errors[login] = "repository is visible but the login has no push permission"
+                errors[login] = (
+                    "repository is visible but the login has no push permission"
+                )
                 continue
             accessible.append((login, repository))
 
@@ -208,6 +210,7 @@ class Publisher:
             )
 
         self.login, repository = accessible[0]
+        self.can_force_merge = bool((repository.get("permissions") or {}).get("admin"))
         self.summary["login"] = self.login
         self.summary["repository"] = repository["full_name"]
 
@@ -266,71 +269,15 @@ class Publisher:
                 matches.append(pr)
         return sorted(matches, key=lambda item: item["number"])
 
-    def base_head(self) -> str:
-        branch = self.api(f"/repos/{{owner}}/{{repo}}/branches/{self.base}")
-        commit = branch.get("commit") or {}
-        return commit.get("id") or commit.get("sha") or ""
-
-    def contains_commit(self, descendant: str, ancestor: str) -> bool:
-        if descendant == ancestor:
-            return True
-        comparison = self.api(
-            f"/repos/{{owner}}/{{repo}}/compare/{ancestor}...{descendant}"
-        )
-        status = str(comparison.get("status") or "").lower()
-        behind_by = int(comparison.get("behind_by") or 0)
-        return status in {"ahead", "identical"} and behind_by == 0
-
-    def validate_after_sha(self) -> None:
-        if not self.after_sha:
-            return
-        if not SHA.fullmatch(self.after_sha):
-            raise ReleaseError("--after-sha must be a Git commit SHA")
-        base_head = self.base_head()
-        if not self.contains_commit(base_head, self.after_sha):
-            raise ReleaseError(
-                f"commit {self.after_sha} is not present on base branch {self.base}"
-            )
-
-    def release_contains_after_sha(self, pr: dict[str, Any]) -> bool:
-        if not self.after_sha:
-            return True
-        head_sha = (pr.get("head") or {}).get("sha") or ""
-        return bool(head_sha) and self.contains_commit(head_sha, self.after_sha)
-
     def select_release_pr(self, number: int | None) -> dict[str, Any]:
         if number is not None:
-            def find_selected():
-                pr = self.get_pr(number)
-                return pr if self.release_contains_after_sha(pr) else None
-
-            if self.after_sha:
-                return self.wait(
-                    f"Release PR #{number} containing {self.after_sha}",
-                    find_selected,
-                )
-            return find_selected()
-
-        if not self.after_sha:
-            candidates = self.open_release_prs()
-            if len(candidates) != 1:
-                raise ReleaseError(
-                    f"expected exactly one open Release PR, found {len(candidates)}"
-                )
-            return candidates[0]
-
-        def find_updated():
-            matches = [
-                pr for pr in self.open_release_prs() if self.release_contains_after_sha(pr)
-            ]
-            if len(matches) > 1:
-                raise ReleaseError("multiple matching Release PRs found")
-            return matches[0] if matches else None
-
-        return self.wait(
-            f"Release Please PR containing {self.after_sha}",
-            find_updated,
-        )
+            return self.get_pr(number)
+        candidates = self.open_release_prs()
+        if len(candidates) != 1:
+            raise ReleaseError(
+                f"expected exactly one open Release PR, found {len(candidates)}"
+            )
+        return candidates[0]
 
     def validate_release_pr(self, pr: dict[str, Any]) -> str:
         number = int(pr["number"])
@@ -351,8 +298,6 @@ class Publisher:
             raise ReleaseError("PR is not a Release Please branch")
         if pr.get("mergeable") is False and not pr.get("merged"):
             raise ReleaseError("Release PR has conflicts")
-        if not self.release_contains_after_sha(pr):
-            raise ReleaseError("Release PR does not contain --after-sha")
         return match.group("version")
 
     def merge_release_pr(self, number: int, expected_head: str) -> dict[str, Any]:
@@ -361,23 +306,29 @@ class Publisher:
             self.log(f"Release PR #{number} is already merged")
             return pr
         endpoint = f"/repos/{self.repo_slug}/pulls/{number}/merge"
-        command = [
-            "tea",
-            "api",
-            "--login",
-            str(self.login),
-            "--method",
-            "POST",
-            "--field",
-            "do=rebase",
-            "--field",
-            f"head_commit_id={expected_head}",
-            "--Field",
-            "delete_branch_after_merge=true",
-            endpoint,
-        ]
+
+        def merge_command(*, force: bool) -> list[str]:
+            command = [
+                "tea",
+                "api",
+                "--login",
+                str(self.login),
+                "--method",
+                "POST",
+                "--field",
+                "do=rebase",
+                "--field",
+                f"head_commit_id={expected_head}",
+                "--Field",
+                "delete_branch_after_merge=true",
+            ]
+            if force:
+                command.extend(["--field", "force_merge=true"])
+            command.append(endpoint)
+            return command
+
         try:
-            result = self.command(command, check=False)
+            result = self.command(merge_command(force=False), check=False)
         except NetworkAccessRequired as exc:
             try:
                 refreshed = self.get_pr(number)
@@ -395,8 +346,63 @@ class Publisher:
                 f"Release PR #{number} head changed: "
                 f"expected={expected_head}, actual={actual_head}"
             )
-        detail = result.stderr.strip() or result.stdout.strip() or "merge state unchanged"
-        raise ReleaseError(f"Release PR #{number} merge failed: {detail}")
+        normal_detail = (
+            result.stderr.strip() or result.stdout.strip() or "merge state unchanged"
+        )
+        try:
+            self.validate_release_pr(refreshed)
+        except ReleaseError as exc:
+            raise ReleaseError(
+                f"Release PR #{number} normal merge failed: {normal_detail}; "
+                f"administrator force merge refused: {exc}"
+            ) from exc
+        if refreshed.get("mergeable") is not True:
+            raise ReleaseError(
+                f"Release PR #{number} normal merge failed: {normal_detail}; "
+                "administrator force merge refused because Gitea did not confirm "
+                "that the PR is conflict-free"
+            )
+        if not self.can_force_merge:
+            raise ReleaseError(
+                f"Release PR #{number} normal merge failed: {normal_detail}; "
+                f"Tea login {self.login!r} has no repository administrator permission"
+            )
+
+        self.log(
+            f"Release PR #{number} is blocked by the normal merge gate; "
+            "trying one administrator force merge"
+        )
+        try:
+            force_result = self.command(merge_command(force=True), check=False)
+        except NetworkAccessRequired as exc:
+            try:
+                force_refreshed = self.get_pr(number)
+            except ReleaseError:
+                raise exc
+            if force_refreshed.get("merged"):
+                self.summary["force_merge_used"] = True
+                return force_refreshed
+            raise exc
+
+        force_refreshed = self.get_pr(number)
+        if force_refreshed.get("merged"):
+            self.summary["force_merge_used"] = True
+            return force_refreshed
+        force_head = (force_refreshed.get("head") or {}).get("sha")
+        if force_head != expected_head:
+            raise ReleaseError(
+                f"Release PR #{number} head changed during administrator force merge: "
+                f"expected={expected_head}, actual={force_head}"
+            )
+        force_detail = (
+            force_result.stderr.strip()
+            or force_result.stdout.strip()
+            or "merge state unchanged"
+        )
+        raise ReleaseError(
+            f"Release PR #{number} normal merge failed: {normal_detail}; "
+            f"administrator force merge failed: {force_detail}"
+        )
 
     def workflow_runs(self) -> list[dict[str, Any]]:
         data = self.api(
@@ -414,7 +420,11 @@ class Publisher:
                     and Path(path.split("@", 1)[0]).name == self.workflow
                 ):
                     candidates.append(run)
-            return max(candidates, key=lambda item: item.get("id", 0)) if candidates else None
+            return (
+                max(candidates, key=lambda item: item.get("id", 0))
+                if candidates
+                else None
+            )
 
         return self.wait("release workflow creation", find)
 
@@ -439,7 +449,9 @@ class Publisher:
         ]
         if failed:
             raise ReleaseError(f"workflow #{run_id} has unsuccessful jobs: {failed}")
-        if not any(str(job.get("conclusion") or "").lower() == "success" for job in jobs):
+        if not any(
+            str(job.get("conclusion") or "").lower() == "success" for job in jobs
+        ):
             raise ReleaseError(f"workflow #{run_id} has no successful jobs")
         return run
 
@@ -466,7 +478,9 @@ class Publisher:
         except NetworkAccessRequired:
             raise
         except ReleaseError as exc:
-            warning = f"Release API verification failed after workflow and Tag success: {exc}"
+            warning = (
+                f"Release API verification failed after workflow and Tag success: {exc}"
+            )
             self.summary["warnings"].append(warning)
             self.log(f"warning: {warning}")
 
@@ -535,14 +549,13 @@ def require_merge_commit_sha(pr: dict[str, Any], number: int) -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", required=True, type=Path, help="Gitea worktree root")
-    parser.add_argument("--after-sha", help="merged commit that the Release PR must contain")
     parser.add_argument("--release-pr", type=int, help="specific Release Please PR")
     parser.add_argument("--base", default="main", help="release target branch")
     parser.add_argument("--login", help="Tea login profile; auto-detected by default")
     parser.add_argument("--workflow", help="release workflow filename")
     parser.add_argument("--release-head-prefix", help="Release Please branch prefix")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--poll-interval", type=int, default=5)
+    parser.add_argument("--poll-interval", type=int, default=2)
     parser.add_argument("--timeout", type=int, default=900)
     args = parser.parse_args()
     if args.poll_interval < 1 or args.timeout < 1:
@@ -562,20 +575,17 @@ def main() -> int:
             base=args.base,
             workflow=workflow,
             release_head_prefix=(
-                args.release_head_prefix
-                or f"release-please--branches--{args.base}"
+                args.release_head_prefix or f"release-please--branches--{args.base}"
             ),
             poll_interval=args.poll_interval,
             timeout=args.timeout,
             dry_run=args.dry_run,
-            after_sha=args.after_sha,
             login=args.login,
         )
         summary = publisher.summary
 
         with publisher.stage("validate environment"):
             publisher.validate_environment()
-            publisher.validate_after_sha()
 
         with publisher.stage("select Release PR"):
             release_pr = publisher.select_release_pr(args.release_pr)
@@ -606,9 +616,7 @@ def main() -> int:
             merged_release = publisher.merge_release_pr(
                 release_number, release_expected_head
             )
-            release_head = require_merge_commit_sha(
-                merged_release, release_number
-            )
+            release_head = require_merge_commit_sha(merged_release, release_number)
 
         with publisher.stage("wait for release workflow"):
             run = publisher.wait_for_workflow(release_head)

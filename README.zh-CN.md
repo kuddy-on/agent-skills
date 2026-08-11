@@ -15,9 +15,12 @@
 | `gitea-merge` | 校验普通 Pull Request，并使用 rebase、squash 或 merge commit 合并。 |
 | `gitea-release` | 合并 Release Please Pull Request，并验证 Workflow、Tag 和 Gitea Release。 |
 
-三个 Skill 均可独立安装和使用。`gitea-release` 不依赖 `gitea-merge`。组合“合并并发布”
-流程时，将普通 Pull Request 合并后的 commit SHA 通过 `--after-sha` 传给
-`gitea-release`。
+三个 Skill 均可独立安装和使用。`gitea-release` 不依赖 `gitea-merge`，并且只处理已经
+存在的 Release Please Pull Request。
+
+`gitea-review` 会先根据元数据判断 PR 规模，再交给一个不继承当前对话且可复用的 worker。
+快速和聚焦复审使用 medium reasoning，中型 PR 使用 high，大型 PR 使用 xhigh；父 Agent
+不会读取 patch。
 
 ## 环境要求
 
@@ -58,6 +61,14 @@ npx skills update --global --yes
 
 ## 开发
 
+先安装开发工具（ShellCheck 使用操作系统的软件包管理器安装），再运行格式与静态检查：
+
+```bash
+python -m pip install --requirement requirements-dev.txt
+go install mvdan.cc/sh/v3/cmd/shfmt@v3.13.1
+scripts/check.sh
+```
+
 运行单元测试：
 
 ```bash
@@ -77,11 +88,13 @@ tests/integration/run.sh
 
 ```text
 agent-skills/
+├── scripts/
 ├── skills/
 │   ├── gitea-merge/
 │   ├── gitea-release/
 │   └── gitea-review/
 ├── tests/
+├── AGENTS.md
 ├── CONTRIBUTING.md
 ├── LICENSE
 ├── README.md

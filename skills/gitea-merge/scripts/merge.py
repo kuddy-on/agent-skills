@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import re
 import shutil
@@ -72,6 +73,7 @@ class Merger:
         self.owner: str | None = None
         self.repo_name: str | None = None
         self.repo_slug: str | None = None
+        self._commit_cache: dict[int, list[dict[str, Any]]] = {}
         self.summary: dict[str, Any] = {
             "repository": None,
             "login": None,
@@ -111,9 +113,7 @@ class Merger:
         return result
 
     def api_for_login(self, endpoint: str, login: str) -> Any:
-        result = self.command(
-            ["tea", "api", "--login", login, endpoint], check=False
-        )
+        result = self.command(["tea", "api", "--login", login, endpoint], check=False)
         if result.returncode:
             detail = result.stderr.strip() or result.stdout.strip()
             raise MergeError(f"tea api failed for login {login!r}: {detail}")
@@ -163,7 +163,9 @@ class Merger:
                 None,
             )
             if selected is None:
-                raise MergeError(f"Tea login {self.requested_login!r} is not configured")
+                raise MergeError(
+                    f"Tea login {self.requested_login!r} is not configured"
+                )
             if not login_matches_host(selected, host):
                 raise MergeError(
                     f"Tea login {self.requested_login!r} does not match origin host {host}"
@@ -194,7 +196,9 @@ class Merger:
                 continue
             permissions = repository.get("permissions") or {}
             if not (permissions.get("push") or permissions.get("admin")):
-                errors[login] = "repository is visible but the login has no push permission"
+                errors[login] = (
+                    "repository is visible but the login has no push permission"
+                )
                 continue
             accessible.append((login, repository))
 
@@ -260,7 +264,11 @@ class Merger:
         return {user_id: state for user_id, (_, state) in latest.items()}
 
     def pr_commits(self, number: int) -> list[dict[str, Any]]:
-        return self.api(f"/repos/{{owner}}/{{repo}}/pulls/{number}/commits")
+        if number not in self._commit_cache:
+            self._commit_cache[number] = self.api(
+                f"/repos/{{owner}}/{{repo}}/pulls/{number}/commits"
+            )
+        return self._commit_cache[number]
 
     def select_merge_strategy(self, number: int) -> dict[str, Any]:
         requested = self.requested_merge_strategy
@@ -349,16 +357,37 @@ class Merger:
             raise MergeError(f"PR #{number} is not open")
         if pr.get("mergeable") is False:
             raise MergeError(f"PR #{number} has conflicts")
-        if not self.skip_ci_check:
-            head_sha = (pr.get("head") or {}).get("sha")
-            status = self.api(f"/repos/{{owner}}/{{repo}}/commits/{head_sha}/status")
-            if str(status.get("state") or "").lower() != "success":
-                raise MergeError(
-                    f"PR #{number} CI is {status.get('state') or 'missing'}, expected success"
+        head_sha = (pr.get("head") or {}).get("sha")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+            status_future = (
+                pool.submit(
+                    self.api,
+                    f"/repos/{{owner}}/{{repo}}/commits/{head_sha}/status",
                 )
+                if not self.skip_ci_check
+                else None
+            )
+            reviews_future = pool.submit(self.latest_review_states, number)
+            commits_future = (
+                pool.submit(
+                    self.api,
+                    f"/repos/{{owner}}/{{repo}}/pulls/{number}/commits",
+                )
+                if self.requested_merge_strategy == "auto"
+                else None
+            )
+            status = status_future.result() if status_future else None
+            review_states = reviews_future.result()
+            if commits_future:
+                self._commit_cache[number] = commits_future.result()
+
+        if status is not None and str(status.get("state") or "").lower() != "success":
+            raise MergeError(
+                f"PR #{number} CI is {status.get('state') or 'missing'}, expected success"
+            )
         blocked = [
             user_id
-            for user_id, state in self.latest_review_states(number).items()
+            for user_id, state in review_states.items()
             if state == "REQUEST_CHANGES"
         ]
         if blocked:
@@ -405,7 +434,9 @@ class Merger:
             raise MergeError(
                 f"PR #{number} head changed: expected={expected_head}, actual={actual_head}"
             )
-        detail = result.stderr.strip() or result.stdout.strip() or "merge state unchanged"
+        detail = (
+            result.stderr.strip() or result.stdout.strip() or "merge state unchanged"
+        )
         raise MergeError(f"PR #{number} merge failed: {detail}")
 
     def base_head(self) -> str:
@@ -437,9 +468,7 @@ class Merger:
 
         current = self.command(["git", "branch", "--show-current"]).stdout.strip()
         if current == feature_branch:
-            dirty = bool(
-                self.command(["git", "status", "--porcelain"]).stdout.strip()
-            )
+            dirty = bool(self.command(["git", "status", "--porcelain"]).stdout.strip())
             if dirty:
                 outcome["local"] = "skipped: feature branch is checked out and dirty"
                 self.summary["cleanup"] = outcome
@@ -451,10 +480,13 @@ class Merger:
                 return
 
         ref = f"refs/heads/{feature_branch}"
-        local_exists = self.command(
-            ["git", "show-ref", "--verify", "--quiet", ref],
-            check=False,
-        ).returncode == 0
+        local_exists = (
+            self.command(
+                ["git", "show-ref", "--verify", "--quiet", ref],
+                check=False,
+            ).returncode
+            == 0
+        )
         if local_exists:
             local_head = self.command(["git", "rev-parse", ref]).stdout.strip()
             if local_head != expected_head:
@@ -504,9 +536,7 @@ def login_matches_host(profile: dict[str, Any], host: str) -> bool:
 
 def validate_repo_root(repo: Path) -> None:
     if not repo.is_dir():
-        raise MergeError(
-            "--repo must be a local Git worktree root, not a slug or URL"
-        )
+        raise MergeError("--repo must be a local Git worktree root, not a slug or URL")
     result = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
         text=True,
@@ -572,7 +602,9 @@ def main() -> int:
                 "already_merged": bool(pr.get("merged")),
                 "expected_head": feature_head,
             }
-            strategy = None if pr.get("merged") else merger.select_merge_strategy(args.pr)
+            strategy = (
+                None if pr.get("merged") else merger.select_merge_strategy(args.pr)
+            )
             summary["merge_strategy"] = strategy
 
         if args.dry_run:

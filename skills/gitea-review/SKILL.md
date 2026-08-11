@@ -1,103 +1,91 @@
 ---
 name: gitea-review
-description: Review or re-review Gitea pull requests from `/review` commands or Gitea `/pulls/NUMBER` URLs, using `tea` and Gitea API only, then submit and verify a formal multiline review. Use for Chinese or English requests such as review, 评审, 审核, 复审, 再看看, 已修复再审, or submit review comments. Isolate every new PR in its own fresh sub-agent, reuse that worker for the same PR, and automatically select a small, medium, large, or focused re-review lane.
+description: Review or re-review Gitea pull requests from `/review` commands or Gitea `/pulls/NUMBER` URLs, using Tea/Gitea API only, then submit and verify a formal review. Isolate each PR in one reusable sub-agent and route its reasoning effort by change size.
 ---
 
 # Review Gitea PR
 
-Use `scripts/review_pr.py` for classification, cached snapshots, patch selection, head guarding, submission, and read-back. Keep code judgement in the dedicated PR worker.
+Use `scripts/review_pr.py` for routing, cached snapshots, bounded patch reads,
+head guarding, submission, and read-back. The parent only routes; the dedicated
+PR worker makes every code judgement. Never clone the repository or create a
+worktree.
 
-## Isolate and classify
+## Route once at the parent
 
-Apply these rules at the root agent:
+Keep parent commentary to one concise skill-use/routing notice and the final
+result. Do not inspect the PR, diff, CI, Issues, or repeat worker progress.
 
-1. Derive a stable worker name from owner, repository, and PR number, such as `review_owner_repository_123`.
-2. Run `<skill-dir>/scripts/review_pr.py classify <PR_URL>`. Read only its head, statistics, and `review_profile`; do not inspect code in the root agent.
-   - `changed_lines` means additions plus deletions. `diff_chars` is diagnostic only and must not affect classification.
-   - Small (`fast`): at most 20 files, 800 changed lines, and 2 high-risk files.
-   - Medium: at most 50 files, 3,000 changed lines, and 10 high-risk files.
-   - Large: any limit above the medium thresholds is exceeded.
-3. For a new PR, spawn exactly one worker with `fork_turns: "none"` and the marker `PR_REVIEW_WORKER`. Never pass unrelated PR history.
-4. Always use `model: "gpt-5.6-sol"`. For `fast` or `focused-rereview`, use `reasoning_effort: "medium"`; for `medium`, use `reasoning_effort: "high"`; for `large`, use `reasoning_effort: "xhigh"`.
-5. Reuse the existing worker with `followup_task` for every later review of the same PR. Pass the latest classification and user clarification. Do not create a replacement merely because the lane changed.
-6. Let the worker fetch, inspect, decide, submit, and read back. Do not duplicate its review in the root agent.
-7. If the previous worker is unavailable, create a fresh worker and reconstruct only this PR's history from Gitea. If sub-agents are unavailable, run worker mode locally and disclose that isolation was unavailable.
+1. Derive a stable worker name such as `review_owner_repository_123`.
+2. Run exactly one routing request:
 
-When the prompt contains `PR_REVIEW_WORKER`, execute the workflow below directly and do not delegate.
+   ```bash
+   <skill-dir>/scripts/review_pr.py classify <PR_URL>
+   ```
 
-## Build the compact snapshot
+   Read only `pr.head`, `stats`, and `review_profile`. Classification uses
+   additions plus deletions: `fast` is at most 20 files/800 changed lines/2
+   high-risk files; `medium` is at most 50/3,000/10; anything larger is
+   `large`.
+3. For a new PR, spawn exactly one worker with no inherited conversation and
+   the marker `PR_REVIEW_WORKER`. Pass only the PR URL, selected Tea login when
+   applicable, classified head/lane, and the user's review requirement.
+4. Use the exact `review_profile.worker.model` and
+   `review_profile.worker.reasoning_effort`: fast or focused re-review uses
+   `gpt-5.6-sol`/`medium`, medium uses `high`, and large uses `xhigh`.
+5. Wait once and return the worker result without duplicating its analysis.
+   Reuse the same worker for later reviews of this PR. If it is unavailable,
+   create one replacement and reconstruct only this PR from Gitea.
 
-Run:
+If sub-agents are unavailable, disclose that isolation is unavailable and run
+worker mode locally. When the prompt contains `PR_REVIEW_WORKER`, skip routing
+and delegation and execute the worker workflow below.
 
-```bash
-<skill-dir>/scripts/review_pr.py snapshot <PR_URL>
-```
+## Prepare once at the worker
 
-The script automatically selects the only configured `tea` login that can access the PR repository. Pass `--login <profile>` when the user explicitly selects a profile or when multiple profiles can access it. Credentials must remain in the `tea` login store and must never be written into the Skill or command output.
-
-This script always accesses Gitea for classification, snapshots, and submission. In a managed sandbox, request network escalation on the first networked invocation; do not probe the network in the sandbox first. Invoke the executable directly rather than through `python3` so the user can persist an approval prefix scoped to this script. If an escalated call still reports `network_access_required`, report the network failure without switching profiles or declaring credentials expired.
-
-Read the compact snapshot completely: PR and Issue contracts, exact base/head, relevant previous reviews, complete changed-file inventory, repository-instruction manifest, incremental comparison, and `review_profile`. Do not run `snapshot --full` unless the compact output is structurally incomplete.
-
-For a new worker, read every repository instruction once with:
-
-```bash
-<skill-dir>/scripts/review_pr.py show <PR_URL> --instructions
-```
-
-Remember the manifest hashes in this PR worker. On later reviews of the same PR, reread instructions only when a hash changes. Always read changed instruction files completely.
-
-Use only Gitea API/`tea`. Do not clone, checkout, pull, or fetch the repository. Ignore CI unless explicitly requested.
-
-## Follow the assigned lane
-
-### Focused re-review
-
-When `lane` is `focused-rereview`, the latest own review already targets the same head. Reassess only the previous finding or the user's changed requirement. Do not traverse the full patch again. Read one focused file only if the clarification cannot be resolved from the cached review context.
-
-### Fast review
-
-When `lane` is `fast`, run exactly one bounded code pass:
+Run exactly once:
 
 ```bash
-<skill-dir>/scripts/review_pr.py show <PR_URL> --review-set --max-chars 50000
+<skill-dir>/scripts/review_pr.py prepare <PR_URL> --max-chars 50000
 ```
 
-Review the changed code and its tests together. Do not expand into unrelated routes, layouts, responsive behavior, dependencies, or architecture unless a changed line or current requirement creates a concrete failure path.
+The script selects the only Tea login that can access the repository. Use
+`--login <profile>` only when explicitly selected or when multiple profiles
+can access it. Keep credentials in Tea's store and out of prompts/output.
 
-### Medium and large review
+The script always accesses Gitea. In a managed sandbox, request network
+escalation on the first invocation and run the executable directly. If an
+escalated call reports `network_access_required`, report it without changing
+profiles or claiming credentials expired.
 
-When `lane` is `medium` or `large`, start with:
+Read `snapshot`, `instructions`, and `initial_patch` completely. They contain
+the exact head, contracts, prior reviews, changed-file inventory, repository
+instructions, lane, and initial code pass. Do not separately call `classify`,
+`snapshot`, `show --instructions`, or the lane's initial `show` command.
 
-```bash
-<skill-dir>/scripts/review_pr.py show <PR_URL> --risk high
-```
+- `focused-rereview`: reassess only the previous finding or clarification.
+- `fast`: treat `initial_patch` as the complete bounded pass.
+- `medium`/`large`: start with the supplied high-risk patches and inventory.
 
-Use the file inventory to select the remaining paths most likely to affect the contract.
+Allow at most one supplemental batch using one `show --files ...` command or
+one batched Tea API request. Stop when each candidate blocker is reproduced or
+disproved. Ignore CI unless explicitly requested; do not expand into unrelated
+code merely to find an issue.
 
-### Supplemental-read limit
+## Submit once
 
-After the lane's initial pass, allow at most one supplemental batch. Put every necessary path into one `show --files ...` command or one batched `tea api` call. Do not alternate repeatedly between reasoning and file retrieval.
+Use `request-changes` for a reproducible P0/P1 blocker, `approve` when none
+remains, and `comment` only when requested. Do not block on style, optional
+refactoring, or accepted/deferred behavior.
 
-Stop exploring when each candidate finding is either reproducible or disproved. Once the required pass finds no P0/P1, approve; do not search unrelated areas merely to find another issue.
-
-## Decide and submit
-
-Prioritize reproducible correctness, security, authorization, data integrity, concurrency, API-contract, migration, and regression defects.
-
-- Use `request-changes` when a P0/P1 blocker remains.
-- Use `approve` when no blocker remains; include only clearly non-blocking P2 notes.
-- Use `comment` only when the user requests comments without a decision.
-
-Do not block for CI, style preference, optional refactoring, or behavior explicitly accepted/deferred by the current product decision.
-
-Write concise multiline Markdown with conclusion, blank lines, priority, trigger, impact, required direction, and reviewed head. Submit once:
+Submit concise multiline Markdown exactly once:
 
 ```bash
 <skill-dir>/scripts/review_pr.py submit <PR_URL> \
   --expected-head <HEAD_SHA> \
   --state approve|request-changes|comment \
-  --body-file <REVIEW_BODY_FILE>
+  --body '<MULTILINE_MARKDOWN>'
 ```
 
-Use the command's `latest_review` to verify reviewer, state, head, and line breaks. Do not perform a separate read-back request. Return only the outcome, findings or confirmed fixes, reviewed head, and review link.
+Use `latest_review` from that command to verify reviewer, state, head, and line
+breaks; do not perform another read-back. Return only the outcome, actionable
+findings or confirmed fixes, reviewed head, and review link.

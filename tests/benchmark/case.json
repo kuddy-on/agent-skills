@@ -1,0 +1,25 @@
+{
+  "cases": [
+    {
+      "name": "merge",
+      "skill": "gitea-merge",
+      "with_skill_prompt": "Use the gitea-merge skill at {skill_dir}/SKILL.md. Merge {pr_url} with rebase using repository {repo_dir} and Tea home {tea_home}. Run the skill script as the first operational command, do not inspect files or run tests, and report the result plus the number of tool calls.",
+      "without_skill_prompt": "Do not load or read any skill. Merge {pr_url} with rebase using repository {repo_dir} and Tea home {tea_home}. Before merging, verify that it targets main, has no conflict, its combined commit status is successful, and it has no outstanding request-changes review. Do not inspect files or run tests. Report the result plus the number of tool calls.",
+      "success": "The PR is merged by rebase and the merge commit SHA is non-empty."
+    },
+    {
+      "name": "review",
+      "skill": "gitea-review",
+      "with_skill_prompt": "Use the gitea-review skill at {skill_dir}/SKILL.md. Review {pr_url} using Tea home {tea_home}; ensure any review worker receives that Tea home. If there is no blocking defect, submit a formal multiline approval. Do not clone or run tests. Report the reviewed head, final review state, and total tool calls including any worker.",
+      "without_skill_prompt": "Do not load or read any skill. Review {pr_url} using Tea home {tea_home}. Inspect the PR metadata and complete diff through tea/Gitea API, then submit a formal multiline approval if there is no blocking defect. Do not clone or run tests. Report the reviewed head, final review state, and tool calls.",
+      "success": "The PR remains open and has an APPROVED formal review from the independent reviewer."
+    },
+    {
+      "name": "release",
+      "skill": "gitea-release",
+      "with_skill_prompt": "Use the gitea-release skill at {skill_dir}/SKILL.md. Validate {pr_url} as a Release Please publication using repository {repo_dir} and Tea home {tea_home}, but use dry-run and do not merge. Run the skill script as the first operational command. Report the validated version and tool calls.",
+      "without_skill_prompt": "Do not load or read any skill. Validate {pr_url} as a Release Please publication using repository {repo_dir} and Tea home {tea_home}, but do not merge. Verify that it is the only open Release Please PR targeting main, its branch and title identify version 1.2.3, it is open and conflict-free, and the release workflow file exists. Report the validated version and tool calls.",
+      "success": "Version 1.2.3 is validated and the Release Please PR remains unmerged."
+    }
+  ]
+}
