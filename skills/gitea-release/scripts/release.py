@@ -31,6 +31,15 @@ NETWORK_ERRORS = (
     "tls handshake timeout",
     "context deadline exceeded",
 )
+HTTP_STATUS = re.compile(r"^HTTP/\S+\s+(?P<status>\d{3})\b", re.MULTILINE)
+FORCE_MERGE_GATE_MESSAGES = (
+    "Not all required status checks successful",
+    "Does not have enough approvals",
+    "There are requested changes",
+    "There are official review requests",
+    "The head branch is behind the base branch",
+    "Changed protected files",
+)
 
 
 class ReleaseError(RuntimeError):
@@ -39,6 +48,44 @@ class ReleaseError(RuntimeError):
 
 class NetworkAccessRequired(ReleaseError):
     pass
+
+
+def api_response_status(result: subprocess.CompletedProcess[str]) -> int | None:
+    matches = list(HTTP_STATUS.finditer(result.stderr))
+    return int(matches[-1].group("status")) if matches else None
+
+
+def api_response_message(result: subprocess.CompletedProcess[str]) -> str:
+    body = result.stdout.strip()
+    if body:
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            return body
+        if isinstance(payload, dict) and payload.get("message"):
+            return str(payload["message"]).strip()
+        return body
+    return ""
+
+
+def format_api_failure(result: subprocess.CompletedProcess[str]) -> str:
+    status = api_response_status(result)
+    message = api_response_message(result)
+    if status is not None and message:
+        return f"HTTP {status}: {message}"
+    return message or result.stderr.strip()
+
+
+def is_force_merge_gate_failure(
+    result: subprocess.CompletedProcess[str],
+) -> bool:
+    if api_response_status(result) != 405:
+        return False
+    message = api_response_message(result).casefold()
+    return any(
+        message == expected.casefold() or message.startswith(f"{expected.casefold()}:")
+        for expected in FORCE_MERGE_GATE_MESSAGES
+    )
 
 
 class Publisher:
@@ -313,6 +360,7 @@ class Publisher:
                 "api",
                 "--login",
                 str(self.login),
+                "--include",
                 "--method",
                 "POST",
                 "--field",
@@ -346,9 +394,13 @@ class Publisher:
                 f"Release PR #{number} head changed: "
                 f"expected={expected_head}, actual={actual_head}"
             )
-        normal_detail = (
-            result.stderr.strip() or result.stdout.strip() or "merge state unchanged"
-        )
+        normal_detail = format_api_failure(result) or "merge state unchanged"
+        if not is_force_merge_gate_failure(result):
+            raise ReleaseError(
+                f"Release PR #{number} normal merge failed: {normal_detail}; "
+                "administrator force merge refused because Gitea did not report "
+                "a recognized branch-protection gate"
+            )
         try:
             self.validate_release_pr(refreshed)
         except ReleaseError as exc:
@@ -394,11 +446,7 @@ class Publisher:
                 f"Release PR #{number} head changed during administrator force merge: "
                 f"expected={expected_head}, actual={force_head}"
             )
-        force_detail = (
-            force_result.stderr.strip()
-            or force_result.stdout.strip()
-            or "merge state unchanged"
-        )
+        force_detail = format_api_failure(force_result) or "merge state unchanged"
         raise ReleaseError(
             f"Release PR #{number} normal merge failed: {normal_detail}; "
             f"administrator force merge failed: {force_detail}"

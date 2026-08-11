@@ -36,7 +36,7 @@ This Skill has no dependency on `gitea-merge` and does not inspect ordinary feat
 1. Validate the worktree, `tea`, Git remote, repository, and release workflow.
 2. Select one explicitly targeted Release Please PR, or require exactly one matching open PR.
 3. Validate its branch, title, semantic version, state, and mergeability.
-4. Rebase-merge the Release Please PR. If the normal merge is blocked while the unchanged PR remains conflict-free and the selected Tea login has repository administrator permission, attempt one administrator force merge with the same rebase strategy.
+4. Rebase-merge the Release Please PR. Attempt one administrator force merge only when Gitea returns HTTP 405 with a recognized branch-protection reason, the unchanged PR remains conflict-free, and the selected Tea login has repository administrator permission.
 5. Wait for the matching release workflow at the resulting base-branch SHA.
 6. Require the workflow and every non-skipped job to succeed.
 7. Verify the version Tag on `origin` and verify the Gitea Release when the API supports it.
@@ -48,7 +48,7 @@ Do not run application tests during publication; the ordinary PR merge gate is s
 
 - Do not retry an ambiguous merge command. Read the Release PR state first.
 - Never force-merge an ordinary PR, a changed PR head, a conflicting PR, or a PR that no longer satisfies every Release Please validation rule.
-- Attempt administrator force merge only once, after a normal merge failure. If administrators must follow branch protection or the selected Tea login is not a repository administrator, stop and report the original and fallback failures.
+- Attempt administrator force merge only once, after an explicitly recognized branch-protection failure. Never escalate server, network, merge-style, signing, work-in-progress, conflict-checking, or unknown failures. If administrators must follow branch protection or the selected Tea login is not a repository administrator, stop and report the original and fallback failures.
 - Require one existing open Release Please PR instead of waiting indefinitely.
 - On timeout or failure, report the current stage, PR/run URL, and exact conclusion.
 

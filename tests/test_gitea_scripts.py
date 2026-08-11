@@ -223,7 +223,13 @@ class ReleaseTests(unittest.TestCase):
         commands = []
         results = iter(
             [
-                completed([], returncode=1, stderr="required checks are missing"),
+                completed(
+                    [],
+                    stdout=json.dumps(
+                        {"message": "Not all required status checks successful"}
+                    ),
+                    stderr="HTTP/1.1 405 Method Not Allowed\n",
+                ),
                 completed([]),
             ]
         )
@@ -260,9 +266,62 @@ class ReleaseTests(unittest.TestCase):
         result = publisher.merge_release_pr(8, "head456")
 
         self.assertTrue(result["merged"])
+        self.assertIn("--include", commands[0])
         self.assertNotIn("force_merge=true", commands[0])
         self.assertIn("force_merge=true", commands[1])
         self.assertTrue(publisher.summary["force_merge_used"])
+
+    def test_release_refuses_force_merge_for_non_gate_failures(self):
+        failures = (
+            (500, "temporary backend failure"),
+            (405, "rebase is not allowed for this repository"),
+            (405, "Please try again later"),
+            (405, "There are requested changes because policy lookup failed"),
+        )
+        for status, message in failures:
+            with self.subTest(status=status, message=message):
+                publisher = self.make_publisher()
+                publisher.login = "admin"
+                publisher.repo_slug = "owner/repo"
+                publisher.can_force_merge = True
+                commands = []
+
+                def command(args, check=True):
+                    commands.append(args)
+                    return completed(
+                        args,
+                        stdout=json.dumps({"message": message}),
+                        stderr=f"HTTP/1.1 {status} failure\n",
+                    )
+
+                states = iter(
+                    [
+                        {"number": 8, "merged": False},
+                        {
+                            "number": 8,
+                            "title": "chore(main): release 1.2.3",
+                            "state": "open",
+                            "merged": False,
+                            "mergeable": True,
+                            "base": {"ref": "main"},
+                            "head": {
+                                "ref": "release-please--branches--main",
+                                "sha": "head456",
+                            },
+                        },
+                    ]
+                )
+                publisher.command = command
+                publisher.get_pr = lambda number: next(states)
+
+                with self.assertRaisesRegex(
+                    release.ReleaseError, "recognized branch-protection gate"
+                ):
+                    publisher.merge_release_pr(8, "head456")
+
+                self.assertEqual(len(commands), 1)
+                self.assertNotIn("force_merge=true", commands[0])
+                self.assertFalse(publisher.summary["force_merge_used"])
 
 
 class ReviewTests(unittest.TestCase):
