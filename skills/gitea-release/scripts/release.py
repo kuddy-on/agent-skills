@@ -32,10 +32,7 @@ NETWORK_ERRORS = (
     "context deadline exceeded",
 )
 HTTP_STATUS = re.compile(r"^HTTP/\S+\s+(?P<status>\d{3})\b", re.MULTILINE)
-FORCE_MERGE_GATE_MESSAGES = (
-    "Not all required status checks successful",
-    "Does not have enough approvals",
-)
+FORCE_MERGE_GATE_MESSAGES = ("Not all required status checks successful",)
 
 
 class ReleaseError(RuntimeError):
@@ -343,21 +340,36 @@ class Publisher:
             raise ReleaseError("Release PR has conflicts")
         return match.group("version")
 
-    def validate_release_force_merge_policy(self) -> None:
+    def validate_release_force_merge_policy(self, expected_head: str) -> None:
         branch = quote(self.base, safe="")
         protection = self.api(f"/repos/{{owner}}/{{repo}}/branch_protections/{branch}")
         if not isinstance(protection, dict):
             raise ReleaseError("Gitea returned invalid branch protection data")
-        status_contexts = protection.get("status_check_contexts") or []
         required_approvals = int(protection.get("required_approvals") or 0)
-        requires_ci = bool(protection.get("enable_status_check")) and bool(
-            status_contexts
-        )
+        requires_ci = bool(protection.get("enable_status_check"))
         requires_review = required_approvals > 0
         if not (requires_ci and requires_review):
             raise ReleaseError(
                 "administrator force merge requires target branch protection to "
-                "configure both required CI status contexts and required approvals"
+                "enable both CI status checks and required approvals"
+            )
+
+        head = quote(expected_head, safe="")
+        combined_status = self.api(
+            f"/repos/{{owner}}/{{repo}}/commits/{head}/status?limit=1"
+        )
+        if (
+            not isinstance(combined_status, dict)
+            or "total_count" not in combined_status
+        ):
+            raise ReleaseError("Gitea returned invalid commit status data")
+        statuses = combined_status.get("statuses")
+        if statuses is not None and not isinstance(statuses, list):
+            raise ReleaseError("Gitea returned invalid commit status data")
+        if int(combined_status["total_count"]) != 0 or statuses:
+            raise ReleaseError(
+                "administrator force merge is limited to Release PR heads with no "
+                "CI status results"
             )
 
     def merge_release_pr(self, number: int, expected_head: str) -> dict[str, Any]:
@@ -433,7 +445,7 @@ class Publisher:
                 f"Tea login {self.login!r} has no repository administrator permission"
             )
         try:
-            self.validate_release_force_merge_policy()
+            self.validate_release_force_merge_policy(expected_head)
         except (ReleaseError, TypeError, ValueError) as exc:
             raise ReleaseError(
                 f"Release PR #{number} normal merge failed: {normal_detail}; "

@@ -262,12 +262,22 @@ class ReleaseTests(unittest.TestCase):
         )
         publisher.command = command
         publisher.get_pr = lambda number: next(states)
-        publisher.api = lambda endpoint: {
-            "branch_name": "main",
-            "enable_status_check": True,
-            "status_check_contexts": ["ci/test"],
-            "required_approvals": 1,
-        }
+        api_endpoints = []
+
+        def api(endpoint):
+            api_endpoints.append(endpoint)
+            if "/branch_protections/" in endpoint:
+                return {
+                    "branch_name": "main",
+                    "enable_status_check": True,
+                    "status_check_contexts": [],
+                    "required_approvals": 1,
+                }
+            if "/status?limit=1" in endpoint:
+                return {"state": "pending", "total_count": 0, "statuses": None}
+            self.fail(f"unexpected API endpoint: {endpoint}")
+
+        publisher.api = api
 
         result = publisher.merge_release_pr(8, "head456")
 
@@ -277,6 +287,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn("force_merge=true", commands[1])
         force_field = commands[1].index("force_merge=true")
         self.assertEqual(commands[1][force_field - 1], "--Field")
+        self.assertTrue(any("/commits/head456/status" in url for url in api_endpoints))
         self.assertTrue(publisher.summary["force_merge_used"])
 
     def test_release_refuses_force_merge_for_non_gate_failures(self):
@@ -284,6 +295,7 @@ class ReleaseTests(unittest.TestCase):
             (500, "temporary backend failure"),
             (405, "rebase is not allowed for this repository"),
             (405, "Please try again later"),
+            (405, "Does not have enough approvals"),
             (405, "There are requested changes because policy lookup failed"),
         )
         for status, message in failures:
@@ -333,24 +345,18 @@ class ReleaseTests(unittest.TestCase):
 
     def test_release_requires_both_ci_and_review_protection_for_force_merge(self):
         cases = (
-            (
-                {
-                    "enable_status_check": True,
-                    "status_check_contexts": ["ci/test"],
-                    "required_approvals": 0,
-                },
-                "Not all required status checks successful",
-            ),
-            (
-                {
-                    "enable_status_check": False,
-                    "status_check_contexts": [],
-                    "required_approvals": 1,
-                },
-                "Does not have enough approvals",
-            ),
+            {
+                "enable_status_check": True,
+                "status_check_contexts": ["ci/test"],
+                "required_approvals": 0,
+            },
+            {
+                "enable_status_check": False,
+                "status_check_contexts": [],
+                "required_approvals": 1,
+            },
         )
-        for protection, message in cases:
+        for protection in cases:
             with self.subTest(protection=protection):
                 publisher = self.make_publisher()
                 publisher.login = "admin"
@@ -362,7 +368,9 @@ class ReleaseTests(unittest.TestCase):
                     commands.append(args)
                     return completed(
                         args,
-                        stdout=json.dumps({"message": message}),
+                        stdout=json.dumps(
+                            {"message": ("Not all required status checks successful")}
+                        ),
                         stderr="HTTP/1.1 405 Method Not Allowed\n",
                     )
 
@@ -388,12 +396,36 @@ class ReleaseTests(unittest.TestCase):
                 publisher.api = lambda endpoint: protection
 
                 with self.assertRaisesRegex(
-                    release.ReleaseError, "both required CI status contexts"
+                    release.ReleaseError,
+                    "enable both CI status checks and required approvals",
                 ):
                     publisher.merge_release_pr(8, "head456")
 
                 self.assertEqual(len(commands), 1)
                 self.assertFalse(publisher.summary["force_merge_used"])
+
+    def test_release_refuses_force_merge_when_head_has_any_ci_status(self):
+        publisher = self.make_publisher()
+
+        def api(endpoint):
+            if "/branch_protections/" in endpoint:
+                return {
+                    "enable_status_check": True,
+                    "status_check_contexts": [],
+                    "required_approvals": 1,
+                }
+            if "/status?limit=1" in endpoint:
+                return {
+                    "state": "failure",
+                    "total_count": 1,
+                    "statuses": [{"context": "ci/test", "status": "failure"}],
+                }
+            self.fail(f"unexpected API endpoint: {endpoint}")
+
+        publisher.api = api
+
+        with self.assertRaisesRegex(release.ReleaseError, "no CI status results"):
+            publisher.validate_release_force_merge_policy("head456")
 
 
 class ReviewTests(unittest.TestCase):

@@ -36,7 +36,7 @@ This Skill has no dependency on `gitea-merge` and does not inspect ordinary feat
 1. Validate the worktree, `tea`, Git remote, repository, and release workflow.
 2. Select one explicitly targeted Release Please PR, or require exactly one matching open PR.
 3. Validate its branch, title, semantic version, state, and mergeability.
-4. Rebase-merge the Release Please PR. Attempt one administrator force merge only when the target branch protection simultaneously requires at least one named CI status context and at least one approval, Gitea returns HTTP 405 because required statuses or approvals are missing, the unchanged PR remains conflict-free, and the selected Tea login has repository administrator permission.
+4. Rebase-merge the Release Please PR. Attempt one administrator force merge only when the target branch protection simultaneously enables CI status checks and requires at least one approval, the Release PR head has no CI status results at all, Gitea returns HTTP 405 because required statuses are missing, the unchanged PR remains conflict-free, and the selected Tea login has repository administrator permission.
 5. Wait for the matching release workflow at the resulting base-branch SHA.
 6. Require the workflow and every non-skipped job to succeed.
 7. Verify the version Tag on `origin` and verify the Gitea Release when the API supports it.
@@ -48,7 +48,7 @@ Do not run application tests during publication; the ordinary PR merge gate is s
 
 - Do not retry an ambiguous merge command. Read the Release PR state first.
 - Never force-merge an ordinary PR, a changed PR head, a conflicting PR, or a PR that no longer satisfies every Release Please validation rule.
-- Attempt administrator force merge only once for a Release Please PR blocked by the repository's combined required-CI and required-approval policy. Never escalate requested changes, official review requests, outdated branches, protected-file changes, server, network, merge-style, signing, work-in-progress, conflict-checking, or unknown failures. If either required CI contexts or required approvals are not configured, stop without forcing.
+- Attempt administrator force merge only once for a Release Please PR with zero CI status results that is blocked by the repository's combined CI-status and required-approval policy. Never force a PR with a pending, failed, or successful CI result, and never escalate approval-only failures, requested changes, official review requests, outdated branches, protected-file changes, server, network, merge-style, signing, work-in-progress, conflict-checking, or unknown failures. If either CI status checks or required approvals are not enabled, stop without forcing.
 - Require one existing open Release Please PR instead of waiting indefinitely.
 - On timeout or failure, report the current stage, PR/run URL, and exact conclusion.
 
