@@ -23,7 +23,6 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlparse
 
-
 PAGE_SIZE = 50
 MAX_FILE_PAGES = 8
 NETWORK_ERRORS = (
@@ -229,7 +228,9 @@ class TeaClient:
             raise RuntimeError(f"Gitea 返回的不是 JSON: {endpoint}") from error
         if isinstance(value, dict) and value.get("message") == "not found":
             raise FileNotFoundError(endpoint)
-        if isinstance(value, dict) and is_network_error(str(value.get("message") or "")):
+        if isinstance(value, dict) and is_network_error(
+            str(value.get("message") or "")
+        ):
             raise RuntimeError(
                 "network_access_required: rerun the same command with sandbox "
                 f"network escalation: {value['message']}"
@@ -320,7 +321,9 @@ def file_score(file: dict[str, Any]) -> int:
 def compact_review(review: dict[str, Any]) -> dict[str, Any]:
     reviewer = review.get("reviewer") or review.get("user") or {}
     if isinstance(reviewer, dict):
-        reviewer_name = reviewer.get("login") or reviewer.get("username") or reviewer.get("name")
+        reviewer_name = (
+            reviewer.get("login") or reviewer.get("username") or reviewer.get("name")
+        )
     else:
         reviewer_name = reviewer
     return {
@@ -338,6 +341,18 @@ def latest_own_review(
 ) -> dict[str, Any] | None:
     own = [review for review in reviews if review.get("reviewer") == reviewer_login]
     return own[-1] if own else None
+
+
+def bounded_review_history(
+    reviews: list[dict[str, Any]], reviewer_login: str, limit: int = 5
+) -> list[dict[str, Any]]:
+    if limit < 1:
+        raise ValueError("review history limit must be positive")
+    recent = reviews[-limit:]
+    own_review = latest_own_review(reviews, reviewer_login)
+    if own_review is None or own_review in recent:
+        return recent
+    return [own_review, *recent]
 
 
 def choose_review_profile(
@@ -458,8 +473,16 @@ def select_review_files(files: list[dict[str, Any]]) -> list[str]:
 
 def fetch_file_pages(client: TeaClient) -> list[dict[str, Any]]:
     pull = client.pull
-    pages: list[dict[str, Any]] = []
-    page_numbers = list(range(1, MAX_FILE_PAGES + 1))
+    first = client.api_json(
+        f"/repos/{pull.slug}/pulls/{pull.index}/files?page=1&limit={PAGE_SIZE}"
+    )
+    if not isinstance(first, list):
+        raise RuntimeError("文件列表格式异常: page=1")
+    if len(first) < PAGE_SIZE:
+        return first
+
+    pages: list[dict[str, Any]] = list(first)
+    page_numbers = list(range(2, MAX_FILE_PAGES + 1))
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_FILE_PAGES) as pool:
         futures = {
             page: pool.submit(
@@ -477,7 +500,9 @@ def fetch_file_pages(client: TeaClient) -> list[dict[str, Any]]:
             if len(value) < PAGE_SIZE:
                 break
     if len(pages) >= PAGE_SIZE * MAX_FILE_PAGES:
-        raise RuntimeError(f"PR 超过 {PAGE_SIZE * MAX_FILE_PAGES} 个文件，请提高脚本分页上限")
+        raise RuntimeError(
+            f"PR 超过 {PAGE_SIZE * MAX_FILE_PAGES} 个文件，请提高脚本分页上限"
+        )
     return pages
 
 
@@ -529,6 +554,56 @@ def cache_dir_for(pull: PullRef, head_sha: str) -> Path:
         / str(pull.index)
         / head_sha
     )
+
+
+def classify_pull(pull: PullRef, login: str | None) -> dict[str, Any]:
+    client = TeaClient(pull, login)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        user_future = pool.submit(client.api_json, "/user")
+        pr_future = pool.submit(client.api_json, pr_endpoint(pull))
+        files_future = pool.submit(fetch_file_pages, client)
+        reviews_future = pool.submit(fetch_reviews, client)
+        authenticated_user = user_future.result()
+        pr = normalize_pr(pr_future.result(), pull)
+        files = files_future.result()
+        reviews = reviews_future.result()
+
+    reviewer_login = authenticated_user.get("login") or authenticated_user.get(
+        "username"
+    )
+    if not reviewer_login:
+        raise RuntimeError("无法识别当前 Gitea 登录用户")
+    head_sha = pr["head"]["sha"]
+    if not head_sha:
+        raise RuntimeError("PR 没有 head SHA")
+    normalized_files = [
+        {
+            "filename": item.get("filename") or "",
+            "additions": int(item.get("additions") or 0),
+            "deletions": int(item.get("deletions") or 0),
+            "risk_tags": risk_tags(str(item.get("filename") or "")),
+        }
+        for item in files
+    ]
+    for item in normalized_files:
+        item["risk_score"] = file_score(item)
+    stats = {
+        "files": len(normalized_files),
+        "additions": sum(item["additions"] for item in normalized_files),
+        "deletions": sum(item["deletions"] for item in normalized_files),
+        "changed_lines": sum(
+            item["additions"] + item["deletions"] for item in normalized_files
+        ),
+        "diff_chars": None,
+        "high_risk_files": sum(item["risk_score"] >= 30 for item in normalized_files),
+    }
+    own_review = latest_own_review(reviews, reviewer_login)
+    return {
+        "pr": {"url": pr["url"], "head": pr["head"]},
+        "review_profile": choose_review_profile(stats, own_review, head_sha),
+        "stats": stats,
+        "cache_reused": False,
+    }
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -601,11 +676,17 @@ def fetch_compare(
 
 def build_snapshot(pull: PullRef, login: str | None, refresh: bool) -> dict[str, Any]:
     client = TeaClient(pull, login)
-    authenticated_user = client.api_json("/user")
-    reviewer_login = authenticated_user.get("login") or authenticated_user.get("username")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        user_future = pool.submit(client.api_json, "/user")
+        pr_future = pool.submit(client.api_json, pr_endpoint(pull))
+        authenticated_user = user_future.result()
+        pr_value = pr_future.result()
+    reviewer_login = authenticated_user.get("login") or authenticated_user.get(
+        "username"
+    )
     if not reviewer_login:
         raise RuntimeError("无法识别当前 Gitea 登录用户")
-    pr = normalize_pr(client.api_json(pr_endpoint(pull)), pull)
+    pr = normalize_pr(pr_value, pull)
     head_sha = pr["head"]["sha"]
     if not head_sha:
         raise RuntimeError("PR 没有 head SHA")
@@ -623,7 +704,7 @@ def build_snapshot(pull: PullRef, login: str | None, refresh: bool) -> dict[str,
             issues = issues_future.result()
         bundle = load_json(bundle_path)
         bundle["pr"] = pr
-        bundle["reviews"] = reviews[-5:]
+        bundle["reviews"] = bounded_review_history(reviews, reviewer_login)
         bundle["issues"] = issues
         stats = bundle.setdefault("stats", {})
         if "changed_lines" not in stats:
@@ -710,7 +791,7 @@ def build_snapshot(pull: PullRef, login: str | None, refresh: bool) -> dict[str,
                 for commit in commits
             ],
             "files": files,
-            "reviews": reviews[-5:],
+            "reviews": bounded_review_history(reviews, reviewer_login),
             "issues": issues,
             "instructions": instructions,
             "cache": {
@@ -748,6 +829,80 @@ def build_snapshot(pull: PullRef, login: str | None, refresh: bool) -> dict[str,
     }
     write_json(bundle_path, bundle)
     return bundle
+
+
+def build_review_packet(
+    pull: PullRef, login: str | None, refresh: bool, max_chars: int
+) -> dict[str, Any]:
+    snapshot = build_snapshot(pull, login, refresh)
+    head_sha = snapshot["pr"]["head"]["sha"]
+    target = cache_dir_for(pull, head_sha)
+    patches = split_diff((target / "full.diff").read_text(encoding="utf-8"))
+    profile = snapshot.get("review_profile") or {}
+    lane = str(profile.get("lane") or "medium")
+
+    if lane == "fast":
+        selected = select_review_files(snapshot.get("files", []))
+    elif lane == "focused-rereview":
+        selected = [
+            str(item.get("filename"))
+            for item in (snapshot.get("since_last_own_review") or {}).get("files", [])
+            if item.get("filename")
+        ]
+    else:
+        selected = [
+            str(item.get("filename"))
+            for item in snapshot.get("files", [])
+            if int(item.get("risk_score") or 0) >= 30
+            and "generated" not in item.get("risk_tags", [])
+        ]
+        if not selected:
+            selected = select_review_files(snapshot.get("files", []))[:10]
+
+    fragments: list[str] = []
+    emitted = 0
+    included: list[str] = []
+    omitted: list[str] = []
+    patch_by_path: dict[str, str] = {}
+    for path in selected:
+        patch_text = patches.get(path)
+        if not patch_text:
+            omitted.append(path)
+            continue
+        patch_by_path[path] = patch_text
+        if emitted + len(patch_text) > max_chars:
+            omitted.append(path)
+            continue
+        fragments.append(patch_text)
+        included.append(path)
+        emitted += len(patch_text)
+
+    truncated: list[str] = []
+    if not fragments and omitted and max_chars > 0:
+        path = next((item for item in omitted if item in patch_by_path), None)
+        if path is not None:
+            patch_text = patch_by_path[path]
+            marker = (
+                f"\n===== {path} truncated; fetch its full patch in the "
+                "supplemental read =====\n"
+            )
+            if len(marker) < max_chars:
+                fragment = patch_text[: max_chars - len(marker)] + marker
+            else:
+                fragment = patch_text[:max_chars]
+            if fragment:
+                fragments.append(fragment)
+                truncated.append(path)
+
+    return {
+        "snapshot": compact_snapshot(snapshot, snapshot["reviewer_login"]),
+        "instructions": snapshot.get("instructions", {}),
+        "initial_patch_files": included,
+        "initial_patch": "".join(fragments),
+        "initial_patch_limited": bool(omitted),
+        "initial_patch_omitted_files": omitted,
+        "initial_patch_truncated_files": truncated,
+    }
 
 
 def latest_cache_dir(pull: PullRef) -> Path:
@@ -795,7 +950,9 @@ def show_cached(args: argparse.Namespace) -> None:
             print(f"===== {path} (patch unavailable) =====")
             continue
         if emitted + len(patch) > args.max_chars:
-            print(f"===== output limited at {args.max_chars} chars; remaining files omitted =====")
+            print(
+                f"===== output limited at {args.max_chars} chars; remaining files omitted ====="
+            )
             break
         print(patch, end="" if patch.endswith("\n") else "\n")
         emitted += len(patch)
@@ -824,7 +981,13 @@ def submit_review(args: argparse.Namespace) -> None:
     if not body:
         raise ValueError("评审正文不能为空")
     if args.dry_run:
-        print(json.dumps({"head": head_sha, "state": args.state, "body": body}, ensure_ascii=False, indent=2))
+        print(
+            json.dumps(
+                {"head": head_sha, "state": args.state, "body": body},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return
 
     if args.state in {"approve", "request-changes"}:
@@ -883,6 +1046,14 @@ def create_parser() -> argparse.ArgumentParser:
     snapshot.add_argument("--refresh", action="store_true", help="忽略同 head 缓存")
     snapshot.add_argument("--full", action="store_true", help="输出完整缓存清单")
 
+    prepare = subparsers.add_parser(
+        "prepare", help="一次生成审核上下文、指令和首批 patch"
+    )
+    prepare.add_argument("url")
+    prepare.add_argument("--login", help="Tea 登录配置；默认自动选择唯一可访问账号")
+    prepare.add_argument("--refresh", action="store_true", help="忽略同 head 缓存")
+    prepare.add_argument("--max-chars", type=int, default=50_000)
+
     classify = subparsers.add_parser("classify", help="只输出 head 和评审通道")
     classify.add_argument("url")
     classify.add_argument("--login", help="Tea 登录配置；默认自动选择唯一可访问账号")
@@ -891,7 +1062,9 @@ def create_parser() -> argparse.ArgumentParser:
     show = subparsers.add_parser("show", help="从缓存输出选定 patch，不再请求网络")
     show.add_argument("url")
     show.add_argument("--files", nargs="+")
-    show.add_argument("--review-set", action="store_true", help="输出小 PR 的完整有效代码集")
+    show.add_argument(
+        "--review-set", action="store_true", help="输出小 PR 的完整有效代码集"
+    )
     show.add_argument("--risk", choices=["high", "medium"], default="high")
     show.add_argument("--instructions", action="store_true")
     show.add_argument("--max-chars", type=int, default=120_000)
@@ -913,10 +1086,16 @@ def create_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = create_parser()
     args = parser.parse_args()
+    if args.command in {"prepare", "show"} and args.max_chars < 1:
+        parser.error("--max-chars must be positive")
     try:
-        if args.command in {"snapshot", "classify", "submit"}:
+        if args.command in {"snapshot", "prepare", "classify", "submit"}:
             args.login = resolve_login(parse_pull_url(args.url), args.login)
-        if args.command == "snapshot":
+        if args.command == "prepare":
+            pull = parse_pull_url(args.url)
+            packet = build_review_packet(pull, args.login, args.refresh, args.max_chars)
+            print(json.dumps(packet, ensure_ascii=False, indent=2))
+        elif args.command == "snapshot":
             pull = parse_pull_url(args.url)
             snapshot = build_snapshot(pull, args.login, args.refresh)
             output = (
@@ -927,20 +1106,9 @@ def main() -> int:
             print(json.dumps(output, ensure_ascii=False, indent=2))
         elif args.command == "classify":
             pull = parse_pull_url(args.url)
-            snapshot = build_snapshot(pull, args.login, args.refresh)
             print(
                 json.dumps(
-                    {
-                        "pr": {
-                            "url": snapshot["pr"]["url"],
-                            "head": snapshot["pr"]["head"],
-                        },
-                        "review_profile": snapshot["review_profile"],
-                        "stats": snapshot["stats"],
-                        "cache_reused": snapshot["cache"]["reused_code_snapshot"],
-                    },
-                    ensure_ascii=False,
-                    indent=2,
+                    classify_pull(pull, args.login), ensure_ascii=False, indent=2
                 )
             )
         elif args.command == "show":

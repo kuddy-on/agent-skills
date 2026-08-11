@@ -2,10 +2,12 @@ import importlib.util
 import json
 import subprocess
 import sys
+import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -119,6 +121,44 @@ class MergeTests(unittest.TestCase):
         ]
         self.assertEqual(merger.select_merge_strategy(7)["selected"], "rebase")
 
+    def test_validation_prefetches_independent_gate_data_concurrently(self):
+        merger = self.make_merger()
+        active = 0
+        peak = 0
+        lock = threading.Lock()
+
+        def api(endpoint):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.03)
+            with lock:
+                active -= 1
+            if endpoint.endswith("/status"):
+                return {"state": "success"}
+            if endpoint.endswith("/reviews"):
+                return []
+            if endpoint.endswith("/commits"):
+                return [{"commit": {"message": "feat(api): test"}}]
+            self.fail(f"unexpected endpoint: {endpoint}")
+
+        merger.api = api
+        merger.validate_pr(
+            {
+                "number": 7,
+                "state": "open",
+                "mergeable": True,
+                "base": {"ref": "main"},
+                "head": {"sha": "head123"},
+            }
+        )
+
+        self.assertGreaterEqual(peak, 2)
+        self.assertEqual(
+            merger.pr_commits(7)[0]["commit"]["message"], "feat(api): test"
+        )
+
 
 class ReleaseTests(unittest.TestCase):
     def make_publisher(self, login=None):
@@ -130,7 +170,6 @@ class ReleaseTests(unittest.TestCase):
             1,
             10,
             True,
-            None,
             login,
         )
 
@@ -164,6 +203,22 @@ class ReleaseTests(unittest.TestCase):
         publisher.command = lambda args, check=True: completed(args, stdout="[]")
         self.assertEqual(publisher.api_for_login("/items", "profile"), [])
 
+    def test_release_parses_included_tea_headers_from_stdout(self):
+        result = completed(
+            [],
+            stdout=(
+                "HTTP/1.1 405 Method Not Allowed\r\n"
+                "Content-Type: application/json\r\n\r\n"
+                '{"message":"Not all required status checks successful"}'
+            ),
+        )
+
+        self.assertTrue(release.is_force_merge_gate_failure(result))
+        self.assertEqual(
+            release.format_api_failure(result),
+            "HTTP 405: Not all required status checks successful",
+        )
+
     def test_release_requires_immutable_merge_sha(self):
         with self.assertRaisesRegex(release.ReleaseError, "merge_commit_sha"):
             release.require_merge_commit_sha({"merged": True}, 8)
@@ -175,6 +230,218 @@ class ReleaseTests(unittest.TestCase):
         )
         with self.assertRaises(release.NetworkAccessRequired):
             publisher.verify_release("1.2.3")
+
+    def test_release_uses_one_admin_force_merge_after_gate_failure(self):
+        publisher = self.make_publisher()
+        publisher.login = "admin"
+        publisher.repo_slug = "owner/repo"
+        publisher.can_force_merge = True
+        commands = []
+        results = iter(
+            [
+                completed(
+                    [],
+                    stdout=json.dumps(
+                        {"message": "Not all required status checks successful"}
+                    ),
+                    stderr="HTTP/1.1 405 Method Not Allowed\n",
+                ),
+                completed([]),
+            ]
+        )
+
+        def command(args, check=True):
+            commands.append(args)
+            return next(results)
+
+        states = iter(
+            [
+                {"number": 8, "merged": False, "head": {"sha": "head456"}},
+                {
+                    "number": 8,
+                    "title": "chore(main): release 1.2.3",
+                    "state": "open",
+                    "merged": False,
+                    "mergeable": True,
+                    "base": {"ref": "main"},
+                    "head": {
+                        "ref": "release-please--branches--main",
+                        "sha": "head456",
+                    },
+                },
+                {
+                    "number": 8,
+                    "merged": True,
+                    "merge_commit_sha": "release123",
+                },
+            ]
+        )
+        publisher.command = command
+        publisher.get_pr = lambda number: next(states)
+        api_endpoints = []
+
+        def api(endpoint):
+            api_endpoints.append(endpoint)
+            if "/branch_protections/" in endpoint:
+                return {
+                    "branch_name": "main",
+                    "enable_status_check": True,
+                    "status_check_contexts": [],
+                    "required_approvals": 1,
+                }
+            if "/status?limit=1" in endpoint:
+                return {"state": "pending", "total_count": 0, "statuses": None}
+            self.fail(f"unexpected API endpoint: {endpoint}")
+
+        publisher.api = api
+
+        result = publisher.merge_release_pr(8, "head456")
+
+        self.assertTrue(result["merged"])
+        self.assertIn("--include", commands[0])
+        self.assertNotIn("force_merge=true", commands[0])
+        self.assertIn("force_merge=true", commands[1])
+        force_field = commands[1].index("force_merge=true")
+        self.assertEqual(commands[1][force_field - 1], "--Field")
+        self.assertTrue(any("/commits/head456/status" in url for url in api_endpoints))
+        self.assertTrue(publisher.summary["force_merge_used"])
+
+    def test_release_refuses_force_merge_for_non_gate_failures(self):
+        failures = (
+            (500, "temporary backend failure"),
+            (405, "rebase is not allowed for this repository"),
+            (405, "Please try again later"),
+            (405, "Does not have enough approvals"),
+            (405, "There are requested changes because policy lookup failed"),
+        )
+        for status, message in failures:
+            with self.subTest(status=status, message=message):
+                publisher = self.make_publisher()
+                publisher.login = "admin"
+                publisher.repo_slug = "owner/repo"
+                publisher.can_force_merge = True
+                commands = []
+
+                def command(args, check=True):
+                    commands.append(args)
+                    return completed(
+                        args,
+                        stdout=json.dumps({"message": message}),
+                        stderr=f"HTTP/1.1 {status} failure\n",
+                    )
+
+                states = iter(
+                    [
+                        {"number": 8, "merged": False},
+                        {
+                            "number": 8,
+                            "title": "chore(main): release 1.2.3",
+                            "state": "open",
+                            "merged": False,
+                            "mergeable": True,
+                            "base": {"ref": "main"},
+                            "head": {
+                                "ref": "release-please--branches--main",
+                                "sha": "head456",
+                            },
+                        },
+                    ]
+                )
+                publisher.command = command
+                publisher.get_pr = lambda number: next(states)
+
+                with self.assertRaisesRegex(
+                    release.ReleaseError, "recognized branch-protection gate"
+                ):
+                    publisher.merge_release_pr(8, "head456")
+
+                self.assertEqual(len(commands), 1)
+                self.assertNotIn("force_merge=true", commands[0])
+                self.assertFalse(publisher.summary["force_merge_used"])
+
+    def test_release_requires_both_ci_and_review_protection_for_force_merge(self):
+        cases = (
+            {
+                "enable_status_check": True,
+                "status_check_contexts": ["ci/test"],
+                "required_approvals": 0,
+            },
+            {
+                "enable_status_check": False,
+                "status_check_contexts": [],
+                "required_approvals": 1,
+            },
+        )
+        for protection in cases:
+            with self.subTest(protection=protection):
+                publisher = self.make_publisher()
+                publisher.login = "admin"
+                publisher.repo_slug = "owner/repo"
+                publisher.can_force_merge = True
+                commands = []
+
+                def command(args, check=True):
+                    commands.append(args)
+                    return completed(
+                        args,
+                        stdout=json.dumps(
+                            {"message": ("Not all required status checks successful")}
+                        ),
+                        stderr="HTTP/1.1 405 Method Not Allowed\n",
+                    )
+
+                states = iter(
+                    [
+                        {"number": 8, "merged": False},
+                        {
+                            "number": 8,
+                            "title": "chore(main): release 1.2.3",
+                            "state": "open",
+                            "merged": False,
+                            "mergeable": True,
+                            "base": {"ref": "main"},
+                            "head": {
+                                "ref": "release-please--branches--main",
+                                "sha": "head456",
+                            },
+                        },
+                    ]
+                )
+                publisher.command = command
+                publisher.get_pr = lambda number: next(states)
+                publisher.api = lambda endpoint: protection
+
+                with self.assertRaisesRegex(
+                    release.ReleaseError,
+                    "enable both CI status checks and required approvals",
+                ):
+                    publisher.merge_release_pr(8, "head456")
+
+                self.assertEqual(len(commands), 1)
+                self.assertFalse(publisher.summary["force_merge_used"])
+
+    def test_release_refuses_force_merge_when_head_has_any_ci_status(self):
+        publisher = self.make_publisher()
+
+        def api(endpoint):
+            if "/branch_protections/" in endpoint:
+                return {
+                    "enable_status_check": True,
+                    "status_check_contexts": [],
+                    "required_approvals": 1,
+                }
+            if "/status?limit=1" in endpoint:
+                return {
+                    "state": "failure",
+                    "total_count": 1,
+                    "statuses": [{"context": "ci/test", "status": "failure"}],
+                }
+            self.fail(f"unexpected API endpoint: {endpoint}")
+
+        publisher.api = api
+
+        with self.assertRaisesRegex(release.ReleaseError, "no CI status results"):
+            publisher.validate_release_force_merge_policy("head456")
 
 
 class ReviewTests(unittest.TestCase):
@@ -192,6 +459,206 @@ class ReviewTests(unittest.TestCase):
     def test_pull_url_uses_hostname_without_port(self):
         pull = review.parse_pull_url("https://gitea.example:3000/owner/repo/pulls/1")
         self.assertEqual(pull.host, "gitea.example")
+
+    def test_small_pr_fetches_only_first_file_page(self):
+        pull = review.PullRef("gitea.example", "owner", "repo", 1, "url")
+
+        class Client:
+            def __init__(self):
+                self.pull = pull
+                self.endpoints = []
+
+            def api_json(self, endpoint):
+                self.endpoints.append(endpoint)
+                return [{"filename": "app.py"}]
+
+        client = Client()
+        files = review.fetch_file_pages(client)
+
+        self.assertEqual(files, [{"filename": "app.py"}])
+        self.assertEqual(len(client.endpoints), 1)
+
+    def test_prepare_packet_combines_snapshot_instructions_and_patch(self):
+        pull = review.PullRef("gitea.example", "owner", "repo", 1, "url")
+        snapshot = {
+            "reviewer_login": "reviewer",
+            "pr": {
+                "url": "url",
+                "head": {"sha": "head123", "ref": "feature"},
+                "base": {"sha": "base123", "ref": "main"},
+            },
+            "stats": {"files": 1, "changed_lines": 2},
+            "commits": [],
+            "files": [
+                {
+                    "filename": "app.py",
+                    "risk_tags": [],
+                    "risk_score": 10,
+                }
+            ],
+            "reviews": [],
+            "issues": [],
+            "instructions": {"AGENTS.md": "Review carefully."},
+            "review_profile": {"lane": "fast"},
+            "since_last_own_review": None,
+            "cache": {},
+            "commands": {},
+        }
+        diff = "diff --git a/app.py b/app.py\n+print('ok')\n"
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory)
+            (target / "full.diff").write_text(diff, encoding="utf-8")
+            with (
+                patch.object(review, "build_snapshot", return_value=snapshot),
+                patch.object(review, "cache_dir_for", return_value=target),
+            ):
+                packet = review.build_review_packet(pull, "reviewer", False, 50_000)
+
+        self.assertEqual(packet["instructions"]["AGENTS.md"], "Review carefully.")
+        self.assertEqual(packet["initial_patch_files"], ["app.py"])
+        self.assertIn("print('ok')", packet["initial_patch"])
+
+    def test_prepare_packet_does_not_go_empty_on_oversized_first_patch(self):
+        pull = review.PullRef("gitea.example", "owner", "repo", 1, "url")
+        snapshot = {
+            "reviewer_login": "reviewer",
+            "pr": {"url": "url", "head": {"sha": "head123"}},
+            "stats": {"files": 2, "changed_lines": 2},
+            "commits": [],
+            "files": [
+                {
+                    "filename": "large.py",
+                    "risk_tags": [],
+                    "risk_score": 20,
+                },
+                {
+                    "filename": "small.py",
+                    "risk_tags": [],
+                    "risk_score": 10,
+                },
+            ],
+            "reviews": [],
+            "issues": [],
+            "instructions": {},
+            "review_profile": {"lane": "fast"},
+            "since_last_own_review": None,
+            "cache": {},
+            "commands": {},
+        }
+        diff = (
+            "diff --git a/large.py b/large.py\n+"
+            + "+x" * 200
+            + "\ndiff --git a/small.py b/small.py\n+ok\n"
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory)
+            (target / "full.diff").write_text(diff, encoding="utf-8")
+            with (
+                patch.object(review, "build_snapshot", return_value=snapshot),
+                patch.object(review, "cache_dir_for", return_value=target),
+            ):
+                packet = review.build_review_packet(pull, "reviewer", False, 100)
+
+        self.assertIn("small.py", packet["initial_patch_files"])
+        self.assertIn("large.py", packet["initial_patch_omitted_files"])
+        self.assertTrue(packet["initial_patch"])
+        self.assertTrue(packet["initial_patch_limited"])
+
+    def test_prepare_packet_truncates_when_every_patch_is_oversized(self):
+        pull = review.PullRef("gitea.example", "owner", "repo", 1, "url")
+        snapshot = {
+            "reviewer_login": "reviewer",
+            "pr": {"url": "url", "head": {"sha": "head123"}},
+            "stats": {"files": 1, "changed_lines": 1},
+            "commits": [],
+            "files": [{"filename": "large.py", "risk_tags": [], "risk_score": 20}],
+            "reviews": [],
+            "issues": [],
+            "instructions": {},
+            "review_profile": {"lane": "fast"},
+            "since_last_own_review": None,
+            "cache": {},
+            "commands": {},
+        }
+        diff = "diff --git a/large.py b/large.py\n" + "+x" * 200 + "\n"
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory)
+            (target / "full.diff").write_text(diff, encoding="utf-8")
+            with (
+                patch.object(review, "build_snapshot", return_value=snapshot),
+                patch.object(review, "cache_dir_for", return_value=target),
+            ):
+                packet = review.build_review_packet(pull, "reviewer", False, 80)
+
+        self.assertTrue(packet["initial_patch"])
+        self.assertLessEqual(len(packet["initial_patch"]), 80)
+        self.assertEqual(packet["initial_patch_truncated_files"], ["large.py"])
+        self.assertEqual(packet["initial_patch_omitted_files"], ["large.py"])
+
+    def test_bounded_review_history_retains_latest_own_review(self):
+        own_review = {
+            "id": 1,
+            "reviewer": "reviewer",
+            "commit_id": "head123",
+        }
+        reviews = [own_review] + [
+            {"id": number, "reviewer": f"other-{number}", "commit_id": "head123"}
+            for number in range(2, 8)
+        ]
+
+        bounded = review.bounded_review_history(reviews, "reviewer")
+        profile = review.choose_review_profile(
+            {}, review.latest_own_review(bounded, "reviewer"), "head123"
+        )
+
+        self.assertIn(own_review, bounded)
+        self.assertEqual(profile["lane"], "focused-rereview")
+
+    def test_review_profile_routes_reasoning_effort_by_scale(self):
+        fast = review.choose_review_profile(
+            {"files": 20, "changed_lines": 800, "high_risk_files": 2},
+            None,
+            "head123",
+        )
+        medium = review.choose_review_profile(
+            {"files": 21, "changed_lines": 801, "high_risk_files": 3},
+            None,
+            "head123",
+        )
+        large = review.choose_review_profile(
+            {"files": 51, "changed_lines": 3_001, "high_risk_files": 11},
+            None,
+            "head123",
+        )
+        focused = review.choose_review_profile(
+            {"files": 100, "changed_lines": 10_000, "high_risk_files": 20},
+            {"commit_id": "head123"},
+            "head123",
+        )
+
+        self.assertEqual(
+            (fast["lane"], fast["worker"]["reasoning_effort"]),
+            ("fast", "medium"),
+        )
+        self.assertEqual(
+            (medium["lane"], medium["worker"]["reasoning_effort"]),
+            ("medium", "high"),
+        )
+        self.assertEqual(
+            (large["lane"], large["worker"]["reasoning_effort"]),
+            ("large", "xhigh"),
+        )
+        self.assertEqual(
+            (focused["lane"], focused["worker"]["reasoning_effort"]),
+            ("focused-rereview", "medium"),
+        )
+        self.assertEqual(
+            {profile["worker"]["model"] for profile in (fast, medium, large, focused)},
+            {"gpt-5.6-sol"},
+        )
 
 
 if __name__ == "__main__":

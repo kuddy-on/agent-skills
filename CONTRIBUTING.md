@@ -32,6 +32,20 @@ safe failure over hidden fallback behavior.
 
 ## Tests
 
+Install Ruff, shfmt, and ShellCheck, then run repository-wide format and static
+checks:
+
+```bash
+python -m pip install --requirement requirements-dev.txt
+go install mvdan.cc/sh/v3/cmd/shfmt@v3.13.1
+scripts/check.sh
+```
+
+Install ShellCheck with the operating system package manager before running the
+script. The checks validate Python and Bash formatting, static errors, and
+Python syntax. The unit suite also validates every skill's front matter, agent
+metadata, script shebang, and executable mode.
+
 Run the unit suite:
 
 ```bash

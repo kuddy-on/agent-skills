@@ -7,6 +7,8 @@ description: Validate and merge ordinary Gitea pull requests with explicit or ev
 
 Use [scripts/merge.py](scripts/merge.py) for validation, strategy selection, merging, and optional branch cleanup. Do not reproduce the sequence with ad hoc `tea` or Git commands when this Skill is available.
 
+Run the script directly in the current agent as the first operational command. Do not create a subagent or worktree, inspect the repository, probe `tea`, or pre-fetch PR state. The script performs those checks in one process. Request sandbox network escalation on this first call.
+
 ## Run the merge
 
 ```bash
@@ -20,6 +22,7 @@ Use [scripts/merge.py](scripts/merge.py) for validation, strategy selection, mer
 - Use `--skip-ci-check` only when the user explicitly authorizes merging without successful CI.
 - Use `--base <branch>` only when the PR targets a branch other than `main`.
 - Pass `--login <profile>` when the user selects a Tea profile. Otherwise the script selects the only configured profile for `origin` that has push access; it stops when the choice is ambiguous.
+- Do not run `--dry-run` before an authorized real merge unless the user explicitly requests a preview.
 
 Treat an explicit request to merge a specified PR as authorization for that merge. Do not infer authorization to clean branches or bypass gates.
 
@@ -41,7 +44,7 @@ An explicit user-selected strategy is authoritative.
 
 Require the PR to target the configured base branch, have no conflict, have successful CI, and have no outstanding request-changes review. Preserve unrelated working-tree changes. If cleanup is requested and the worktree is dirty, merge the PR but skip local branch synchronization and deletion.
 
-Return the JSON summary, including the selected strategy, evidence, merged commit SHA, PR URL, cleanup result, and stage durations. When publication is also requested, pass `merge_commit_sha` to `gitea-release --after-sha` if that Skill is available.
+Return the JSON summary, including the selected strategy, evidence, merged commit SHA, PR URL, cleanup result, and stage durations. When publication is also requested, wait until Release Please has created or updated its release PR, then invoke `gitea-release` if that Skill is available.
 
 ## Sandbox network access
 

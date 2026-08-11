@@ -9,7 +9,7 @@ PASSWORD='AgentSkillsTest-42!'
 
 cleanup() {
   status=$?
-  if (( status != 0 )); then
+  if ((status != 0)); then
     docker logs "$CONTAINER" >&2 2>/dev/null || true
   fi
   docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
@@ -91,7 +91,7 @@ mkdir -p "$REPO_DIR" "$TEA_HOME"
 git -C "$REPO_DIR" init --initial-branch=main >/dev/null
 git -C "$REPO_DIR" config user.name 'Integration Test'
 git -C "$REPO_DIR" config user.email integration@example.test
-printf 'main\n' > "$REPO_DIR/content.txt"
+printf 'main\n' >"$REPO_DIR/content.txt"
 git -C "$REPO_DIR" add content.txt
 git -C "$REPO_DIR" commit --message 'chore: initialize repository' >/dev/null
 
@@ -102,7 +102,7 @@ git -C "$REPO_DIR" -c "http.extraHeader=Authorization: Basic $BASIC_AUTH" \
   push --set-upstream origin main >/dev/null
 
 git -C "$REPO_DIR" switch --create feature/integration >/dev/null
-printf 'feature\n' >> "$REPO_DIR/content.txt"
+printf 'feature\n' >>"$REPO_DIR/content.txt"
 git -C "$REPO_DIR" add content.txt
 git -C "$REPO_DIR" commit --message 'feat(integration): verify atomic merge' >/dev/null
 FEATURE_HEAD="$(git -C "$REPO_DIR" rev-parse HEAD)"
@@ -128,8 +128,8 @@ fi
 api POST "/repos/owner/sandbox/statuses/$FEATURE_HEAD" \
   '{"state":"success","context":"integration","description":"temporary CI passed"}' >/dev/null
 PR_NUMBER="$(api POST /repos/owner/sandbox/pulls \
-  '{"title":"feat(integration): verify merge","head":"feature/integration","base":"main","body":"temporary integration PR"}' \
-  | jq --raw-output '.number')"
+  '{"title":"feat(integration): verify merge","head":"feature/integration","base":"main","body":"temporary integration PR"}' |
+  jq --raw-output '.number')"
 test "$PR_NUMBER" -gt 0
 
 HOME="$TEA_HOME" tea login add \
