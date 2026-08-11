@@ -72,6 +72,11 @@ same internal URL, repository, PR number, fixed Git timestamps, and identical
 base/head SHA. Set `BENCHMARK_KEEP=true` to retain raw artifacts under the
 printed temporary directory for debugging.
 
+Release lanes must also create `.benchmark-release-validation.json` in the
+fixture repository. The Skill lane preserves the helper's dry-run JSON; the
+baseline records the observed PR head, workflow, version, and completed manual
+checks. Review verification requires an approval body containing a line break.
+
 To compare review delegation with local worker mode while loading the same
 Skill in both lanes, run:
 

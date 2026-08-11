@@ -63,7 +63,10 @@ instructions, lane, and initial code pass. Do not separately call `classify`,
 `snapshot`, `show --instructions`, or the lane's initial `show` command.
 
 - `focused-rereview`: reassess only the previous finding or clarification.
-- `fast`: treat `initial_patch` as the complete bounded pass.
+- `fast`: treat `initial_patch` as the complete bounded pass only when
+  `initial_patch_limited` is false. When it is true, fetch every path in
+  `initial_patch_omitted_files` in the one supplemental batch before approving;
+  `initial_patch_truncated_files` identifies any partial patch already shown.
 - `medium`/`large`: start with the supplied high-risk patches and inventory.
 
 Allow at most one supplemental batch using one `show --files ...` command or

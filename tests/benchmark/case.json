@@ -17,8 +17,8 @@
     {
       "name": "release",
       "skill": "gitea-release",
-      "with_skill_prompt": "Use the gitea-release skill at {skill_dir}/SKILL.md. Validate {pr_url} as a Release Please publication using repository {repo_dir} and Tea home {tea_home}, but use dry-run and do not merge. Run the skill script as the first operational command. Report the validated version and tool calls.",
-      "without_skill_prompt": "Do not load or read any skill. Validate {pr_url} as a Release Please publication using repository {repo_dir} and Tea home {tea_home}, but do not merge. Verify that it is the only open Release Please PR targeting main, its branch and title identify version 1.2.3, it is open and conflict-free, and the release workflow file exists. Report the validated version and tool calls.",
+      "with_skill_prompt": "Use the gitea-release skill at {skill_dir}/SKILL.md. Validate {pr_url} as a Release Please publication using repository {repo_dir} and Tea home {tea_home}, but use dry-run and do not merge. Run the skill script as the first operational command and save its unmodified JSON stdout to {repo_dir}/.benchmark-release-validation.json; do not synthesize or overwrite that evidence. Report the validated version and tool calls.",
+      "without_skill_prompt": "Do not load or read any skill. Validate {pr_url} as a Release Please publication using repository {repo_dir} and Tea home {tea_home}, but do not merge. Verify that it is the only open Release Please PR targeting main, its branch and title identify version 1.2.3, it is open and conflict-free, and the release workflow file exists. Record observed values, without guessing, at {repo_dir}/.benchmark-release-validation.json as {\"status\":\"dry-run\",\"dry_run\":true,\"version\":\"1.2.3\",\"workflow\":\"release.yml\",\"release_pr\":{\"number\":N,\"expected_head\":\"SHA\"},\"checks\":{\"only_open_release_pr\":true,\"release_metadata\":true,\"workflow_exists\":true}}. Report the validated version and tool calls.",
       "success": "Version 1.2.3 is validated and the Release Please PR remains unmerged."
     }
   ]

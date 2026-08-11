@@ -343,6 +343,18 @@ def latest_own_review(
     return own[-1] if own else None
 
 
+def bounded_review_history(
+    reviews: list[dict[str, Any]], reviewer_login: str, limit: int = 5
+) -> list[dict[str, Any]]:
+    if limit < 1:
+        raise ValueError("review history limit must be positive")
+    recent = reviews[-limit:]
+    own_review = latest_own_review(reviews, reviewer_login)
+    if own_review is None or own_review in recent:
+        return recent
+    return [own_review, *recent]
+
+
 def choose_review_profile(
     stats: dict[str, Any], own_review: dict[str, Any] | None, head_sha: str
 ) -> dict[str, Any]:
@@ -692,7 +704,7 @@ def build_snapshot(pull: PullRef, login: str | None, refresh: bool) -> dict[str,
             issues = issues_future.result()
         bundle = load_json(bundle_path)
         bundle["pr"] = pr
-        bundle["reviews"] = reviews[-5:]
+        bundle["reviews"] = bounded_review_history(reviews, reviewer_login)
         bundle["issues"] = issues
         stats = bundle.setdefault("stats", {})
         if "changed_lines" not in stats:
@@ -779,7 +791,7 @@ def build_snapshot(pull: PullRef, login: str | None, refresh: bool) -> dict[str,
                 for commit in commits
             ],
             "files": files,
-            "reviews": reviews[-5:],
+            "reviews": bounded_review_history(reviews, reviewer_login),
             "issues": issues,
             "instructions": instructions,
             "cache": {
@@ -850,22 +862,46 @@ def build_review_packet(
     fragments: list[str] = []
     emitted = 0
     included: list[str] = []
+    omitted: list[str] = []
+    patch_by_path: dict[str, str] = {}
     for path in selected:
         patch_text = patches.get(path)
         if not patch_text:
+            omitted.append(path)
             continue
+        patch_by_path[path] = patch_text
         if emitted + len(patch_text) > max_chars:
-            break
+            omitted.append(path)
+            continue
         fragments.append(patch_text)
         included.append(path)
         emitted += len(patch_text)
+
+    truncated: list[str] = []
+    if not fragments and omitted and max_chars > 0:
+        path = next((item for item in omitted if item in patch_by_path), None)
+        if path is not None:
+            patch_text = patch_by_path[path]
+            marker = (
+                f"\n===== {path} truncated; fetch its full patch in the "
+                "supplemental read =====\n"
+            )
+            if len(marker) < max_chars:
+                fragment = patch_text[: max_chars - len(marker)] + marker
+            else:
+                fragment = patch_text[:max_chars]
+            if fragment:
+                fragments.append(fragment)
+                truncated.append(path)
 
     return {
         "snapshot": compact_snapshot(snapshot, snapshot["reviewer_login"]),
         "instructions": snapshot.get("instructions", {}),
         "initial_patch_files": included,
         "initial_patch": "".join(fragments),
-        "initial_patch_limited": len(included) < len(selected),
+        "initial_patch_limited": bool(omitted),
+        "initial_patch_omitted_files": omitted,
+        "initial_patch_truncated_files": truncated,
     }
 
 
@@ -1050,6 +1086,8 @@ def create_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = create_parser()
     args = parser.parse_args()
+    if args.command in {"prepare", "show"} and args.max_chars < 1:
+        parser.error("--max-chars must be positive")
     try:
         if args.command in {"snapshot", "prepare", "classify", "submit"}:
             args.login = resolve_login(parse_pull_url(args.url), args.login)

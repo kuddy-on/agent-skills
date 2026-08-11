@@ -203,6 +203,22 @@ class ReleaseTests(unittest.TestCase):
         publisher.command = lambda args, check=True: completed(args, stdout="[]")
         self.assertEqual(publisher.api_for_login("/items", "profile"), [])
 
+    def test_release_parses_included_tea_headers_from_stdout(self):
+        result = completed(
+            [],
+            stdout=(
+                "HTTP/1.1 405 Method Not Allowed\r\n"
+                "Content-Type: application/json\r\n\r\n"
+                '{"message":"Not all required status checks successful"}'
+            ),
+        )
+
+        self.assertTrue(release.is_force_merge_gate_failure(result))
+        self.assertEqual(
+            release.format_api_failure(result),
+            "HTTP 405: Not all required status checks successful",
+        )
+
     def test_release_requires_immutable_merge_sha(self):
         with self.assertRaisesRegex(release.ReleaseError, "merge_commit_sha"):
             release.require_merge_commit_sha({"merged": True}, 8)
@@ -502,6 +518,104 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(packet["instructions"]["AGENTS.md"], "Review carefully.")
         self.assertEqual(packet["initial_patch_files"], ["app.py"])
         self.assertIn("print('ok')", packet["initial_patch"])
+
+    def test_prepare_packet_does_not_go_empty_on_oversized_first_patch(self):
+        pull = review.PullRef("gitea.example", "owner", "repo", 1, "url")
+        snapshot = {
+            "reviewer_login": "reviewer",
+            "pr": {"url": "url", "head": {"sha": "head123"}},
+            "stats": {"files": 2, "changed_lines": 2},
+            "commits": [],
+            "files": [
+                {
+                    "filename": "large.py",
+                    "risk_tags": [],
+                    "risk_score": 20,
+                },
+                {
+                    "filename": "small.py",
+                    "risk_tags": [],
+                    "risk_score": 10,
+                },
+            ],
+            "reviews": [],
+            "issues": [],
+            "instructions": {},
+            "review_profile": {"lane": "fast"},
+            "since_last_own_review": None,
+            "cache": {},
+            "commands": {},
+        }
+        diff = (
+            "diff --git a/large.py b/large.py\n+"
+            + "+x" * 200
+            + "\ndiff --git a/small.py b/small.py\n+ok\n"
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory)
+            (target / "full.diff").write_text(diff, encoding="utf-8")
+            with (
+                patch.object(review, "build_snapshot", return_value=snapshot),
+                patch.object(review, "cache_dir_for", return_value=target),
+            ):
+                packet = review.build_review_packet(pull, "reviewer", False, 100)
+
+        self.assertIn("small.py", packet["initial_patch_files"])
+        self.assertIn("large.py", packet["initial_patch_omitted_files"])
+        self.assertTrue(packet["initial_patch"])
+        self.assertTrue(packet["initial_patch_limited"])
+
+    def test_prepare_packet_truncates_when_every_patch_is_oversized(self):
+        pull = review.PullRef("gitea.example", "owner", "repo", 1, "url")
+        snapshot = {
+            "reviewer_login": "reviewer",
+            "pr": {"url": "url", "head": {"sha": "head123"}},
+            "stats": {"files": 1, "changed_lines": 1},
+            "commits": [],
+            "files": [{"filename": "large.py", "risk_tags": [], "risk_score": 20}],
+            "reviews": [],
+            "issues": [],
+            "instructions": {},
+            "review_profile": {"lane": "fast"},
+            "since_last_own_review": None,
+            "cache": {},
+            "commands": {},
+        }
+        diff = "diff --git a/large.py b/large.py\n" + "+x" * 200 + "\n"
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory)
+            (target / "full.diff").write_text(diff, encoding="utf-8")
+            with (
+                patch.object(review, "build_snapshot", return_value=snapshot),
+                patch.object(review, "cache_dir_for", return_value=target),
+            ):
+                packet = review.build_review_packet(pull, "reviewer", False, 80)
+
+        self.assertTrue(packet["initial_patch"])
+        self.assertLessEqual(len(packet["initial_patch"]), 80)
+        self.assertEqual(packet["initial_patch_truncated_files"], ["large.py"])
+        self.assertEqual(packet["initial_patch_omitted_files"], ["large.py"])
+
+    def test_bounded_review_history_retains_latest_own_review(self):
+        own_review = {
+            "id": 1,
+            "reviewer": "reviewer",
+            "commit_id": "head123",
+        }
+        reviews = [own_review] + [
+            {"id": number, "reviewer": f"other-{number}", "commit_id": "head123"}
+            for number in range(2, 8)
+        ]
+
+        bounded = review.bounded_review_history(reviews, "reviewer")
+        profile = review.choose_review_profile(
+            {}, review.latest_own_review(bounded, "reviewer"), "head123"
+        )
+
+        self.assertIn(own_review, bounded)
+        self.assertEqual(profile["lane"], "focused-rereview")
 
     def test_review_profile_routes_reasoning_effort_by_scale(self):
         fast = review.choose_review_profile(

@@ -44,12 +44,26 @@ class NetworkAccessRequired(ReleaseError):
 
 
 def api_response_status(result: subprocess.CompletedProcess[str]) -> int | None:
-    matches = list(HTTP_STATUS.finditer(result.stderr))
-    return int(matches[-1].group("status")) if matches else None
+    for stream in (result.stderr, result.stdout):
+        matches = list(HTTP_STATUS.finditer(stream))
+        if matches:
+            return int(matches[-1].group("status"))
+    return None
+
+
+def api_response_body(result: subprocess.CompletedProcess[str]) -> str:
+    body = result.stdout.strip()
+    normalized = body.replace("\r\n", "\n")
+    matches = list(HTTP_STATUS.finditer(normalized))
+    if matches:
+        header_end = normalized.find("\n\n", matches[-1].end())
+        if header_end >= 0:
+            return normalized[header_end + 2 :].strip()
+    return body
 
 
 def api_response_message(result: subprocess.CompletedProcess[str]) -> str:
-    body = result.stdout.strip()
+    body = api_response_body(result)
     if body:
         try:
             payload = json.loads(body)

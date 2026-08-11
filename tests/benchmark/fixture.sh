@@ -5,6 +5,7 @@ ACTION="${1:-}"
 STATE_DIR="${2:-}"
 CASE_NAME="${3:-merge}"
 LANE="${4:-sample}"
+VERIFY_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/verify.py"
 IMAGE="${GITEA_TEST_IMAGE:-gitea/gitea:1.27.1}"
 PASSWORD='AgentSkillsBenchmark-42!'
 AGENT_GITEA_URL='http://gitea:3000'
@@ -49,46 +50,28 @@ if [[ "$ACTION" == verify ]]; then
     --header "Authorization: token $token" \
     "$url/api/v1/repos/owner/$repo/pulls/$pr")"
 
+  reviews='[]'
+  evidence='null'
   if [[ "$case_name" == review ]]; then
     reviews="$(curl --fail --silent --show-error \
       --header "Authorization: token $token" \
       "$url/api/v1/repos/owner/$repo/pulls/$pr/reviews")"
-    jq -n --argjson entry "$entry" --argjson state "$state" \
-      --argjson reviews "$reviews" \
-      '{entries: [$entry + {
-        approved: ([$reviews[] | select(
-          (.state | ascii_upcase) == "APPROVED" and
-          ((.user.login // .user.username) == "reviewer") and
-          (.commit_id == $state.head.sha)
-        )] | length > 0),
-        success: (
-          $state.state == "open" and
-          ([$reviews[] | select(
-            (.state | ascii_upcase) == "APPROVED" and
-            ((.user.login // .user.username) == "reviewer") and
-            (.commit_id == $state.head.sha)
-          )] | length > 0)
-        )
-      }]} | . + {success: .entries[0].success}'
-  else
-    jq -n --argjson entry "$entry" --argjson state "$state" \
-      --arg case_name "$case_name" \
-      '{entries: [$entry + {
-        merged: $state.merged,
-        merge_commit_sha: $state.merge_commit_sha,
-        success: (
-          if $case_name == "merge" then
-            $state.merged == true and
-            (($state.merge_commit_sha // "") | length > 0)
-          else
-            $state.merged == false and
-            $state.state == "open" and
-            $state.title == "chore(main): release 1.2.3" and
-            $state.head.ref == "release-please--branches--main"
-          end
-        )
-      }]} | . + {success: .entries[0].success}'
   fi
+  if [[ "$case_name" == release ]]; then
+    repo_dir="$(jq -r '.repo_dir' <<<"$entry")"
+    evidence_file="$repo_dir/.benchmark-release-validation.json"
+    if [[ -f "$evidence_file" ]]; then
+      if ! evidence="$(jq -c . "$evidence_file" 2>/dev/null)"; then
+        evidence='null'
+      fi
+    fi
+  fi
+  verification_input="$(jq -n \
+    --arg case "$case_name" --argjson entry "$entry" \
+    --argjson state "$state" --argjson reviews "$reviews" \
+    --argjson evidence "$evidence" \
+    '{case:$case,entry:$entry,state:$state,reviews:$reviews,evidence:$evidence}')"
+  python3 "$VERIFY_SCRIPT" <<<"$verification_input"
   exit 0
 fi
 
@@ -120,7 +103,7 @@ cleanup_on_error() {
 }
 trap cleanup_on_error EXIT INT TERM
 
-for command in curl docker git jq tea realpath sha256sum; do
+for command in curl docker git jq python3 tea realpath sha256sum; do
   command -v "$command" >/dev/null || {
     printf 'required command not found: %s\n' "$command" >&2
     exit 1
