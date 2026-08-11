@@ -1,0 +1,4 @@
+interface:
+  display_name: "评审 Gitea PR"
+  short_description: "隔离审查 Gitea PR 的代码变更并提交和验证正式 Review"
+  default_prompt: "使用 $gitea-review 审查指定的 Gitea PR，并提交和验证正式 Review。"

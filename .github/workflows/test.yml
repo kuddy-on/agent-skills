@@ -1,0 +1,40 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m unittest discover -s tests -v
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Tea
+        env:
+          TEA_SHA256: 3680e6844b413bd2eb171294e8b1aeb440cdf7bebcfead2ec36b91c1e334310d
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl --fail --location --silent --show-error \
+            https://dl.gitea.com/tea/0.14.0/tea-0.14.0-linux-amd64 \
+            --output "$RUNNER_TEMP/bin/tea"
+          echo "$TEA_SHA256  $RUNNER_TEMP/bin/tea" | sha256sum --check --strict
+          chmod 0755 "$RUNNER_TEMP/bin/tea"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - run: tests/integration/run.sh

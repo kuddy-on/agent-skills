@@ -1,0 +1,61 @@
+name: Bug report
+description: Report reproducible incorrect behavior in a skill.
+title: "bug: "
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Remove credentials, private repository data, internal domains, and
+        personal information before submitting.
+  - type: dropdown
+    id: skill
+    attributes:
+      label: Affected skill
+      options:
+        - gitea-review
+        - gitea-merge
+        - gitea-release
+        - Repository tooling or documentation
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: Describe the observed behavior and its impact.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Use a temporary repository and sanitized values.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Agent runtime, OS, Python version, Tea version, and Gitea version.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized output
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Confirmation
+      options:
+        - label: I searched existing issues and pull requests.
+          required: true
+        - label: This report contains no secrets or private data.
+          required: true

@@ -1,0 +1,36 @@
+name: Question
+description: Ask for help using or configuring a skill.
+title: "question: "
+body:
+  - type: dropdown
+    id: skill
+    attributes:
+      label: Skill
+      options:
+        - gitea-review
+        - gitea-merge
+        - gitea-release
+        - Installation or updates
+    validations:
+      required: true
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: Explain what you are trying to accomplish and where you are blocked.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Agent runtime, OS, Python version, Tea version, and Gitea version.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Confirmation
+      options:
+        - label: I read the README and SUPPORT.md.
+          required: true
+        - label: This question contains no secrets or private data.
+          required: true

@@ -1,0 +1,43 @@
+name: Feature request
+description: Propose a focused improvement to a skill or repository tooling.
+title: "feat: "
+body:
+  - type: dropdown
+    id: skill
+    attributes:
+      label: Target skill
+      options:
+        - gitea-review
+        - gitea-merge
+        - gitea-release
+        - New skill
+        - Repository tooling or documentation
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the workflow problem, not only the proposed solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Explain inputs, outputs, safety boundaries, and failure behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Confirmation
+      options:
+        - label: I searched existing issues and pull requests.
+          required: true
+        - label: The proposal is not specific to a private repository or organization.
+          required: true
