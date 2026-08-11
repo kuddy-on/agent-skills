@@ -13,7 +13,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 RELEASE_TITLE = re.compile(
     r"^chore\((?P<branch>[^)]+)\): release "
@@ -35,10 +35,6 @@ HTTP_STATUS = re.compile(r"^HTTP/\S+\s+(?P<status>\d{3})\b", re.MULTILINE)
 FORCE_MERGE_GATE_MESSAGES = (
     "Not all required status checks successful",
     "Does not have enough approvals",
-    "There are requested changes",
-    "There are official review requests",
-    "The head branch is behind the base branch",
-    "Changed protected files",
 )
 
 
@@ -347,6 +343,23 @@ class Publisher:
             raise ReleaseError("Release PR has conflicts")
         return match.group("version")
 
+    def validate_release_force_merge_policy(self) -> None:
+        branch = quote(self.base, safe="")
+        protection = self.api(f"/repos/{{owner}}/{{repo}}/branch_protections/{branch}")
+        if not isinstance(protection, dict):
+            raise ReleaseError("Gitea returned invalid branch protection data")
+        status_contexts = protection.get("status_check_contexts") or []
+        required_approvals = int(protection.get("required_approvals") or 0)
+        requires_ci = bool(protection.get("enable_status_check")) and bool(
+            status_contexts
+        )
+        requires_review = required_approvals > 0
+        if not (requires_ci and requires_review):
+            raise ReleaseError(
+                "administrator force merge requires target branch protection to "
+                "configure both required CI status contexts and required approvals"
+            )
+
     def merge_release_pr(self, number: int, expected_head: str) -> dict[str, Any]:
         pr = self.get_pr(number)
         if pr.get("merged"):
@@ -371,7 +384,7 @@ class Publisher:
                 "delete_branch_after_merge=true",
             ]
             if force:
-                command.extend(["--field", "force_merge=true"])
+                command.extend(["--Field", "force_merge=true"])
             command.append(endpoint)
             return command
 
@@ -419,6 +432,13 @@ class Publisher:
                 f"Release PR #{number} normal merge failed: {normal_detail}; "
                 f"Tea login {self.login!r} has no repository administrator permission"
             )
+        try:
+            self.validate_release_force_merge_policy()
+        except (ReleaseError, TypeError, ValueError) as exc:
+            raise ReleaseError(
+                f"Release PR #{number} normal merge failed: {normal_detail}; "
+                f"administrator force merge refused: {exc}"
+            ) from exc
 
         self.log(
             f"Release PR #{number} is blocked by the normal merge gate; "
