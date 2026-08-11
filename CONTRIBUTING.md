@@ -61,6 +61,23 @@ tests/integration/run.sh
 The integration test requires Docker, Git, curl, jq, and Tea 0.14.0. It must use
 only the temporary Gitea instance created by the test.
 
+## Releases
+
+Release Please runs after each push to `main`. It maintains a release pull
+request from Conventional Commits, then creates the version tag and GitHub
+Release after that pull request is merged. The `simple` releaser updates
+`version.txt` and `CHANGELOG.md`.
+
+The workflow uses its job-scoped `github.token`; no separate release secret is
+required. Repository Actions settings must allow GitHub Actions to create and
+approve pull requests. Checks created for a `GITHUB_TOKEN`-authored release
+pull request require a maintainer with write access to approve them before they
+run.
+
+Merge a release pull request only after its required checks pass and all review
+conversations are resolved. Use `fix:`, `feat:`, or a `!`/`BREAKING CHANGE`
+footer to select patch, minor, or major SemVer increments.
+
 ## Style
 
 - Target Python 3.11 or newer.
