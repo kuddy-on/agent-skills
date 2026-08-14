@@ -12,7 +12,7 @@
 | Skill | 用途 |
 | --- | --- |
 | `gitea-review` | 审查或复审 Gitea Pull Request，并提交正式 Review。 |
-| `gitea-merge` | 校验普通 Pull Request，并使用 rebase、squash 或 merge commit 合并。 |
+| `gitea-merge` | 校验并合并普通 Pull Request；squash 标题兼容 Release Please，且默认删除已合并的特性分支。 |
 | `gitea-release` | 合并 Release Please Pull Request，并验证 Workflow、Tag 和 Gitea Release。 |
 
 三个 Skill 均可独立安装和使用。`gitea-release` 不依赖 `gitea-merge`，并且只处理已经

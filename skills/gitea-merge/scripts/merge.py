@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 
 CONVENTIONAL_TITLE = re.compile(
     r"^(?P<type>feat|fix|perf|refactor|docs|test|build|ci|chore|style|revert)"
-    r"(?:\((?P<scope>[^)]+)\))?!?:\s+\S+"
+    r"(?:\((?P<scope>[^)]+)\))?(?P<breaking>!)?:\s+\S.*"
 )
 TEMPORARY_TITLE = re.compile(
     r"(?:^fixup!|^squash!|\bWIP\b|debug|临时|修复(?:测试|CI)|"
@@ -51,6 +51,68 @@ class DecisionRequired(MergeError):
 
 class NetworkAccessRequired(MergeError):
     pass
+
+
+def validate_squash_title(title: str | None) -> str:
+    candidate = str(title or "").strip()
+    match = CONVENTIONAL_TITLE.fullmatch(candidate)
+    if not match or (
+        match.group("type") not in {"feat", "fix", "perf"}
+        and not match.group("breaking")
+    ):
+        raise MergeError(
+            "squash merge requires a release-triggering Conventional Commit title "
+            "such as 'feat(api): add endpoint', 'fix: handle timeout', "
+            "'perf: reduce latency', or 'refactor!: replace legacy API'; rename "
+            "the PR or pass --squash-title"
+        )
+    return candidate
+
+
+def select_squash_title(
+    commits: list[dict[str, Any]],
+    pr_title: str | None = None,
+    explicit_title: str | None = None,
+) -> tuple[str, str]:
+    if explicit_title is not None:
+        return validate_squash_title(explicit_title), "explicit"
+
+    if pr_title is not None:
+        try:
+            return validate_squash_title(pr_title), "pull request"
+        except MergeError:
+            pass
+
+    candidates: list[tuple[int, int, str]] = []
+    for index, commit in enumerate(commits):
+        message = str(commit.get("commit", {}).get("message") or "")
+        lines = message.splitlines()
+        if not lines:
+            continue
+        title = lines[0].strip()
+        match = CONVENTIONAL_TITLE.fullmatch(title)
+        if not match or TEMPORARY_TITLE.search(title):
+            continue
+        commit_type = match.group("type")
+        if match.group("breaking"):
+            rank = 0
+        elif commit_type == "feat":
+            rank = 1
+        elif commit_type == "fix":
+            rank = 2
+        elif commit_type == "perf":
+            rank = 3
+        else:
+            continue
+        candidates.append((rank, index, title))
+
+    if not candidates:
+        raise MergeError(
+            "squash merge has no release-triggering Conventional Commit title; "
+            "use feat, fix, perf, a breaking type!, or pass --squash-title"
+        )
+    _, _, selected = min(candidates)
+    return selected, "pull request commits"
 
 
 class Merger:
@@ -399,6 +461,7 @@ class Merger:
         strategy: str,
         expected_head: str,
         delete_branch: bool,
+        squash_title: str | None = None,
     ) -> dict[str, Any]:
         endpoint = f"/repos/{self.repo_slug}/pulls/{number}/merge"
         command = [
@@ -414,8 +477,15 @@ class Merger:
             f"head_commit_id={expected_head}",
             "--Field",
             f"delete_branch_after_merge={str(delete_branch).lower()}",
-            endpoint,
         ]
+        if strategy == "squash":
+            command.extend(
+                [
+                    "--field",
+                    f"merge_title_field={validate_squash_title(squash_title)}",
+                ]
+            )
+        command.append(endpoint)
         try:
             result = self.command(command, check=False)
         except NetworkAccessRequired as exc:
@@ -559,7 +629,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--base", default="main", help="target branch")
     parser.add_argument("--login", help="Tea login profile; auto-detected by default")
-    parser.add_argument("--cleanup", action="store_true", help="clean feature branch")
+    parser.add_argument(
+        "--squash-title",
+        help="release-triggering title overriding automatic PR/commit selection",
+    )
+    branch_cleanup = parser.add_mutually_exclusive_group()
+    branch_cleanup.add_argument(
+        "--cleanup",
+        dest="cleanup",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    branch_cleanup.add_argument(
+        "--keep-branch",
+        dest="cleanup",
+        action="store_false",
+        help="preserve the feature branch after merge",
+    )
+    parser.set_defaults(cleanup=True)
     parser.add_argument(
         "--skip-ci-check",
         action="store_true",
@@ -606,6 +693,17 @@ def main() -> int:
                 None if pr.get("merged") else merger.select_merge_strategy(args.pr)
             )
             summary["merge_strategy"] = strategy
+            squash_title = None
+            if strategy and strategy["selected"] == "squash":
+                squash_title, squash_title_source = select_squash_title(
+                    merger.pr_commits(args.pr),
+                    pr.get("title"),
+                    args.squash_title,
+                )
+                strategy["squash_title"] = squash_title
+                strategy["squash_title_source"] = squash_title_source
+            elif args.squash_title is not None:
+                raise MergeError("--squash-title requires the squash merge strategy")
 
         if args.dry_run:
             if strategy:
@@ -624,6 +722,7 @@ def main() -> int:
                     strategy["selected"],
                     feature_head,
                     args.cleanup,
+                    squash_title,
                 )
 
         summary["merge_commit_sha"] = require_merge_commit_sha(merged, args.pr)

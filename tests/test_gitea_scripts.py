@@ -33,6 +33,15 @@ class MergeTests(unittest.TestCase):
     def make_merger(self, login=None):
         return merge.Merger(Path.cwd(), "main", "auto", True, False, login)
 
+    def test_branch_cleanup_is_default_and_can_be_disabled(self):
+        required = ["merge.py", "--repo", ".", "--pr", "7"]
+        with patch.object(sys, "argv", required):
+            self.assertTrue(merge.parse_args().cleanup)
+        with patch.object(sys, "argv", [*required, "--keep-branch"]):
+            self.assertFalse(merge.parse_args().cleanup)
+        with patch.object(sys, "argv", [*required, "--cleanup"]):
+            self.assertTrue(merge.parse_args().cleanup)
+
     def test_explicit_login_must_match_origin_host(self):
         merger = self.make_merger("other")
         profiles = [{"name": "other", "url": "https://other.example"}]
@@ -67,6 +76,92 @@ class MergeTests(unittest.TestCase):
         self.assertTrue(result["merged"])
         self.assertIn("head_commit_id=head123", commands[0])
         self.assertIn("delete_branch_after_merge=true", commands[0])
+
+    def test_squash_merge_sets_conventional_commit_title(self):
+        merger = self.make_merger()
+        merger.login = "profile"
+        merger.repo_slug = "owner/repo"
+        commands = []
+        merger.command = lambda args, check=True: (
+            commands.append(args) or completed(args)
+        )
+        merger.get_pr = lambda number: {
+            "number": number,
+            "merged": True,
+            "merge_commit_sha": "merged123",
+        }
+
+        merger.merge_pr(
+            7,
+            "squash",
+            "head123",
+            True,
+            "feat(api): consolidate endpoint work",
+        )
+
+        self.assertIn(
+            "merge_title_field=feat(api): consolidate endpoint work",
+            commands[0],
+        )
+
+    def test_squash_title_must_trigger_release(self):
+        self.assertEqual(
+            merge.validate_squash_title("fix: handle timeout"),
+            "fix: handle timeout",
+        )
+        self.assertEqual(
+            merge.validate_squash_title("refactor!: replace legacy API"),
+            "refactor!: replace legacy API",
+        )
+        self.assertEqual(
+            merge.validate_squash_title("perf: reduce latency"),
+            "perf: reduce latency",
+        )
+        with self.assertRaisesRegex(merge.MergeError, "Conventional Commit"):
+            merge.validate_squash_title("Handle timeout")
+        with self.assertRaisesRegex(merge.MergeError, "release-triggering"):
+            merge.validate_squash_title("chore: update tooling")
+
+    def test_squash_title_comes_from_highest_impact_commit(self):
+        title, source = merge.select_squash_title(
+            [
+                {"commit": {"message": "fix: handle timeout"}},
+                {"commit": {"message": "feat(api): add endpoint\n\nDetails"}},
+                {"commit": {"message": "fixup! feat(api): add endpoint"}},
+            ],
+            "Update the API",
+        )
+
+        self.assertEqual(title, "feat(api): add endpoint")
+        self.assertEqual(source, "pull request commits")
+
+    def test_squash_title_prefers_qualifying_pr_title(self):
+        title, source = merge.select_squash_title(
+            [{"commit": {"message": "feat: add endpoint"}}],
+            "fix(api): handle timeout",
+        )
+
+        self.assertEqual(title, "fix(api): handle timeout")
+        self.assertEqual(source, "pull request")
+
+    def test_explicit_squash_title_overrides_pr_title(self):
+        title, source = merge.select_squash_title(
+            [{"commit": {"message": "feat: add endpoint"}}],
+            "fix(api): handle timeout",
+            "perf(api): reduce latency",
+        )
+
+        self.assertEqual(title, "perf(api): reduce latency")
+        self.assertEqual(source, "explicit")
+
+    def test_squash_title_rejects_commits_without_release_entry(self):
+        with self.assertRaisesRegex(merge.MergeError, "no release-triggering"):
+            merge.select_squash_title(
+                [
+                    {"commit": {"message": "chore: update tooling"}},
+                    {"commit": {"message": "docs: update guide"}},
+                ]
+            )
 
     def test_api_accepts_list_responses(self):
         merger = self.make_merger()
