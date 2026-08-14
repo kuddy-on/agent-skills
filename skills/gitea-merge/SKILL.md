@@ -1,11 +1,11 @@
 ---
 name: gitea-merge
-description: Validate and merge ordinary Gitea pull requests with explicit or evidence-based rebase, squash, or merge-commit selection. Use when the user asks to merge a Gitea PR, choose a merge strategy, enforce CI and review gates, or optionally clean the merged feature branch. Do not use for merging Release Please PRs or publishing releases.
+description: Validate and merge ordinary Gitea pull requests with explicit or evidence-based rebase, squash, or merge-commit selection, Release Please-compatible squash titles, and default feature-branch deletion. Use when the user asks to merge a Gitea PR, choose a merge strategy, enforce CI and review gates, control a squash commit title, or preserve the merged branch. Do not use for merging Release Please PRs or publishing releases.
 ---
 
 # Merge Gitea PR
 
-Use [scripts/merge.py](scripts/merge.py) for validation, strategy selection, merging, and optional branch cleanup. Do not reproduce the sequence with ad hoc `tea` or Git commands when this Skill is available.
+Use [scripts/merge.py](scripts/merge.py) for validation, strategy selection, merging, and branch cleanup. Do not reproduce the sequence with ad hoc `tea` or Git commands when this Skill is available.
 
 Run the script directly in the current agent as the first operational command. Do not create a subagent or worktree, inspect the repository, probe `tea`, or pre-fetch PR state. The script performs those checks in one process. Request sandbox network escalation on this first call.
 
@@ -17,14 +17,17 @@ Run the script directly in the current agent as the first operational command. D
 
 - Pass `--merge-strategy rebase|squash|merge` when the user explicitly chooses a strategy.
 - Keep `--merge-strategy auto` when the user does not choose.
-- Add `--cleanup` only when the user explicitly requests branch cleanup.
+- For squash merges, prefer a release-triggering PR title. If it does not qualify, select the highest-impact qualifying commit title: breaking `type!:`, then `feat`, `fix`, and `perf`.
+- Pass `--squash-title <title>` only when the user explicitly supplies an alternative; it overrides both the PR and commit titles. Validate it with the same release-triggering rules. If no override, PR title, or commit title qualifies, stop before merging and ask the user to choose one.
+- Delete the merged remote feature branch and its unchanged local ref by default.
+- Add `--keep-branch` only when the user explicitly requests preserving the feature branch.
 - Add `--dry-run` to inspect the decision without merging.
 - Use `--skip-ci-check` only when the user explicitly authorizes merging without successful CI.
 - Use `--base <branch>` only when the PR targets a branch other than `main`.
 - Pass `--login <profile>` when the user selects a Tea profile. Otherwise the script selects the only configured profile for `origin` that has push access; it stops when the choice is ambiguous.
 - Do not run `--dry-run` before an authorized real merge unless the user explicitly requests a preview.
 
-Treat an explicit request to merge a specified PR as authorization for that merge. Do not infer authorization to clean branches or bypass gates.
+Treat an explicit request to merge a specified PR as authorization for that merge and the default cleanup of its feature branch. Do not infer authorization to preserve the branch or bypass gates.
 
 ## Select the strategy
 
@@ -42,7 +45,7 @@ An explicit user-selected strategy is authoritative.
 
 ## Enforce gates
 
-Require the PR to target the configured base branch, have no conflict, have successful CI, and have no outstanding request-changes review. Preserve unrelated working-tree changes. If cleanup is requested and the worktree is dirty, merge the PR but skip local branch synchronization and deletion.
+Require the PR to target the configured base branch, have no conflict, have successful CI, and have no outstanding request-changes review. Preserve unrelated working-tree changes. Request remote branch deletion atomically with the merge unless `--keep-branch` is set. If the feature branch is checked out with uncommitted changes, keep its local ref while still deleting the remote branch.
 
 Return the JSON summary, including the selected strategy, evidence, merged commit SHA, PR URL, cleanup result, and stage durations. When publication is also requested, wait until Release Please has created or updated its release PR, then invoke `gitea-release` if that Skill is available.
 

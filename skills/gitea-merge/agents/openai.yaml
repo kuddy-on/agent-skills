@@ -1,4 +1,4 @@
 interface:
   display_name: "合并 Gitea PR"
-  short_description: "校验 CI、Review 与冲突并按合适策略合并普通 Gitea PR"
-  default_prompt: "使用 $gitea-merge 校验并合并指定的普通 Gitea PR。"
+  short_description: "规范 squash 标题、校验门禁并删除已合并分支"
+  default_prompt: "使用 $gitea-merge 校验并合并指定的普通 Gitea PR，确保 squash 提交可触发 Release Please 并删除其特性分支。"

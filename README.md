@@ -13,7 +13,7 @@ on Gitea.
 | Skill | Purpose |
 | --- | --- |
 | `gitea-review` | Review or re-review a Gitea pull request and submit a formal review. |
-| `gitea-merge` | Validate and merge an ordinary pull request using rebase, squash, or merge commit. |
+| `gitea-merge` | Merge an ordinary pull request with gated rebase, squash, or merge commit; squash titles are Release Please-compatible, and merged feature branches are deleted by default. |
 | `gitea-release` | Merge a Release Please pull request and verify its workflow, tag, and Gitea Release. |
 
 Each skill can be installed and used independently. `gitea-release` does not

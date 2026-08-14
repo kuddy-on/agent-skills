@@ -105,6 +105,10 @@ git -C "$REPO_DIR" switch --create feature/integration >/dev/null
 printf 'feature\n' >>"$REPO_DIR/content.txt"
 git -C "$REPO_DIR" add content.txt
 git -C "$REPO_DIR" commit --message 'feat(integration): verify atomic merge' >/dev/null
+printf 'follow-up\n' >>"$REPO_DIR/content.txt"
+git -C "$REPO_DIR" add content.txt
+git -C "$REPO_DIR" commit \
+  --message 'fixup! feat(integration): verify atomic merge' >/dev/null
 FEATURE_HEAD="$(git -C "$REPO_DIR" rev-parse HEAD)"
 git -C "$REPO_DIR" -c "http.extraHeader=Authorization: Basic $BASIC_AUTH" \
   push --set-upstream origin feature/integration >/dev/null
@@ -128,7 +132,7 @@ fi
 api POST "/repos/owner/sandbox/statuses/$FEATURE_HEAD" \
   '{"state":"success","context":"integration","description":"temporary CI passed"}' >/dev/null
 PR_NUMBER="$(api POST /repos/owner/sandbox/pulls \
-  '{"title":"feat(integration): verify merge","head":"feature/integration","base":"main","body":"temporary integration PR"}' |
+  '{"title":"Integration merge scenario","head":"feature/integration","base":"main","body":"temporary integration PR"}' |
   jq --raw-output '.number')"
 test "$PR_NUMBER" -gt 0
 
@@ -140,11 +144,25 @@ HOME="$TEA_HOME" tea login add \
 
 RESULT="$(HOME="$TEA_HOME" "$ROOT/skills/gitea-merge/scripts/merge.py" \
   --repo "$REPO_DIR" \
-  --pr "$PR_NUMBER" \
-  --merge-strategy rebase)"
+  --pr "$PR_NUMBER")"
 printf '%s\n' "$RESULT" | jq --exit-status \
-  '.status == "success" and (.merge_commit_sha | length > 0)' >/dev/null
+  '.status == "success" and
+   .merge_strategy.selected == "squash" and
+   .merge_strategy.squash_title == "feat(integration): verify atomic merge" and
+   .merge_strategy.squash_title_source == "pull request commits" and
+   (.merge_commit_sha | length > 0)' >/dev/null
 api GET "/repos/owner/sandbox/pulls/$PR_NUMBER" | jq --exit-status \
   '.merged == true and (.merge_commit_sha | length > 0)' >/dev/null
+git -C "$REPO_DIR" -c "http.extraHeader=Authorization: Basic $BASIC_AUTH" \
+  fetch origin main >/dev/null
+test "$(git -C "$REPO_DIR" log -1 --format=%s FETCH_HEAD)" = \
+  'feat(integration): verify atomic merge'
+api GET /repos/owner/sandbox/branches | jq --exit-status \
+  'map(.name) | index("feature/integration") == null' >/dev/null
+test "$(git -C "$REPO_DIR" branch --show-current)" = main
+if git -C "$REPO_DIR" show-ref --verify --quiet refs/heads/feature/integration; then
+  printf 'merged local feature branch was not deleted\n' >&2
+  exit 1
+fi
 
 printf 'temporary Gitea integration test passed\n'
