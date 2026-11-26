@@ -4,8 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 FIXTURE_SCRIPT="$ROOT/tests/benchmark/fixture.sh"
 IMAGE="${BENCHMARK_IMAGE:-agent-skills-codex-benchmark:0.147.0}"
-MODEL="${BENCHMARK_MODEL:-gpt-5.6-sol}"
-REASONING_EFFORT="${BENCHMARK_REASONING_EFFORT:-medium}"
+MODEL="${BENCHMARK_MODEL:-}"
+REASONING_EFFORT="${BENCHMARK_REASONING_EFFORT:-}"
 REPETITIONS="${BENCHMARK_REPETITIONS:-1}"
 AUTH_FILE="${1:-}"
 
@@ -13,7 +13,17 @@ if [[ -z "$AUTH_FILE" ]]; then
   printf 'usage: %s AUTH_JSON\n' "$0" >&2
   exit 2
 fi
-AUTH_FILE="$(realpath "$AUTH_FILE")"
+if [[ -z "$MODEL" ]]; then
+  printf 'set BENCHMARK_MODEL to a currently available model selected for this benchmark\n' >&2
+  exit 2
+fi
+for command in docker jq python3; do
+  command -v "$command" >/dev/null || {
+    printf 'required command not found: %s\n' "$command" >&2
+    exit 1
+  }
+done
+AUTH_FILE="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$AUTH_FILE")"
 [[ -f "$AUTH_FILE" ]] || {
   printf 'auth file not found: %s\n' "$AUTH_FILE" >&2
   exit 2
@@ -43,13 +53,18 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+now_ms() {
+  python3 -c 'import time; print(time.monotonic_ns() // 1_000_000)'
+}
+
 measure_variant() {
   local variant="$1"
   local state_dir="$2"
   local repetition="$3"
   local entry repo_dir tea_home pr_url prompt network fixture_input
-  local events_file stderr_file start_ns end_ns wall_ms exit_code
+  local events_file stderr_file start_ms end_ms wall_ms exit_code
   local thread_id final_message command_calls collab_calls tool_events usage failed_events
+  local model_args
 
   entry="$(jq -c '.entries[0]' "$state_dir/fixture.json")"
   repo_dir="$(jq -r '.repo_dir' <<<"$entry")"
@@ -59,17 +74,23 @@ measure_variant() {
   network="$(jq -r '.network' "$state_dir/fixture.json")"
 
   common="Use the gitea-review skill at /opt/benchmark-skill/SKILL.md. Review $pr_url using Tea home /run/codex-benchmark/home. If there is no blocking defect, submit a formal multiline approval. Do not clone or run tests. Run prepare exactly once and submit exactly once. Report the reviewed head, final review state, and total tool calls."
+  common+=" For this controlled benchmark, keep the current model and reasoning settings in all workers; do not switch models."
   if [[ "$variant" == subagent ]]; then
     prompt="$common Follow the root workflow and delegate the complete review to exactly one fresh review worker; pass that worker the Tea home."
   else
     prompt="$common PR_REVIEW_WORKER. Execute the complete worker workflow directly in the current agent and do not delegate."
   fi
 
+  model_args=(--model "$MODEL")
+  if [[ -n "$REASONING_EFFORT" ]]; then
+    model_args+=(--config "model_reasoning_effort=\"$REASONING_EFFORT\"")
+  fi
+
   events_file="$RUN_ROOT/review-r$repetition-$variant.jsonl"
   stderr_file="$RUN_ROOT/review-r$repetition-$variant.stderr"
   printf 'running review repetition=%s/%s variant=%s model=%s effort=%s\n' \
     "$repetition" "$REPETITIONS" "$variant" "$MODEL" "$REASONING_EFFORT" >&2
-  start_ns="$(date +%s%N)"
+  start_ms="$(now_ms)"
   set +e
   docker run --rm --network "$network" \
     --tmpfs "/run/codex-benchmark:rw,exec,nosuid,nodev,uid=$(id -u),gid=$(id -g),mode=0700" \
@@ -78,13 +99,12 @@ measure_variant() {
     --mount "type=bind,src=$repo_dir,dst=/workspace" \
     --mount "type=bind,src=$ROOT/skills/gitea-review,dst=/opt/benchmark-skill,readonly" \
     "$IMAGE" \
-    --model "$MODEL" \
-    --config "model_reasoning_effort=\"$REASONING_EFFORT\"" \
+    "${model_args[@]}" \
     "$prompt" >"$events_file" 2>"$stderr_file"
   exit_code=$?
   set -e
-  end_ns="$(date +%s%N)"
-  wall_ms=$(((end_ns - start_ns) / 1000000))
+  end_ms="$(now_ms)"
+  wall_ms=$((end_ms - start_ms))
 
   thread_id="$(jq -sr '[.[] | select(.type == "thread.started") | .thread_id] | last // ""' "$events_file")"
   final_message="$(jq -sr '[.[] | select(.type == "item.completed" and .item.type == "agent_message") | .item.text] | last // ""' "$events_file")"

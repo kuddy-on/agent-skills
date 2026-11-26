@@ -60,11 +60,17 @@ multiple paired samples.
 Run isolated with/without-Skill pairs for all three cases:
 
 ```bash
-tests/benchmark/run.sh /absolute/path/to/auth.json all
+BENCHMARK_MODEL='<available-model-id>' tests/benchmark/run.sh /absolute/path/to/auth.json all
 ```
 
-Set `BENCHMARK_MODEL`, `BENCHMARK_REASONING_EFFORT`, or `BENCHMARK_IMAGE` to
-override the pinned defaults. The runner randomizes lane order, keeps Codex
+Before each benchmark, select a suitable model from the current runtime and
+set `BENCHMARK_MODEL` to its actual identifier. There is no default model.
+Optionally set `BENCHMARK_REASONING_EFFORT` to a value supported by that model;
+otherwise the runtime default applies and the recorded override is empty.
+Use `BENCHMARK_IMAGE` to select a different benchmark image. Paired lanes and
+their workers keep the same selected model and reasoning settings for that run;
+this controls the comparison without creating a permanent tier-to-model mapping.
+The runner randomizes lane order, keeps Codex
 JSONL and stderr outside the mounted repositories, verifies final Gitea state,
 and emits one aggregate JSON document. Set `BENCHMARK_REPETITIONS=3` to run
 three paired samples per case. Every lane gets a fresh Gitea instance with the
@@ -81,7 +87,7 @@ To compare review delegation with local worker mode while loading the same
 Skill in both lanes, run:
 
 ```bash
-tests/benchmark/run-review-ab.sh /absolute/path/to/auth.json
+BENCHMARK_MODEL='<available-model-id>' tests/benchmark/run-review-ab.sh /absolute/path/to/auth.json
 ```
 
 This A/B test changes only the delegation mode. Child-agent internals may not

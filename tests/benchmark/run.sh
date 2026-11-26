@@ -6,8 +6,8 @@ FIXTURE_SCRIPT="$ROOT/tests/benchmark/fixture.sh"
 CASES_FILE="$ROOT/tests/benchmark/case.json"
 AGGREGATE_FILTER="$ROOT/tests/benchmark/aggregate.jq"
 IMAGE="${BENCHMARK_IMAGE:-agent-skills-codex-benchmark:0.147.0}"
-MODEL="${BENCHMARK_MODEL:-gpt-5.6-sol}"
-REASONING_EFFORT="${BENCHMARK_REASONING_EFFORT:-medium}"
+MODEL="${BENCHMARK_MODEL:-}"
+REASONING_EFFORT="${BENCHMARK_REASONING_EFFORT:-}"
 REPETITIONS="${BENCHMARK_REPETITIONS:-1}"
 AUTH_FILE="${1:-}"
 REQUESTED_CASE="${2:-all}"
@@ -16,7 +16,17 @@ if [[ -z "$AUTH_FILE" ]]; then
   printf 'usage: %s AUTH_JSON [all|merge|review|release]\n' "$0" >&2
   exit 2
 fi
-AUTH_FILE="$(realpath "$AUTH_FILE")"
+if [[ -z "$MODEL" ]]; then
+  printf 'set BENCHMARK_MODEL to a currently available model selected for this benchmark\n' >&2
+  exit 2
+fi
+for command in docker jq python3; do
+  command -v "$command" >/dev/null || {
+    printf 'required command not found: %s\n' "$command" >&2
+    exit 1
+  }
+done
+AUTH_FILE="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$AUTH_FILE")"
 [[ -f "$AUTH_FILE" ]] || {
   printf 'auth file not found: %s\n' "$AUTH_FILE" >&2
   exit 2
@@ -29,13 +39,6 @@ AUTH_FILE="$(realpath "$AUTH_FILE")"
   printf 'BENCHMARK_REPETITIONS must be a positive integer: %s\n' "$REPETITIONS" >&2
   exit 2
 }
-
-for command in docker jq realpath; do
-  command -v "$command" >/dev/null || {
-    printf 'required command not found: %s\n' "$command" >&2
-    exit 1
-  }
-done
 docker image inspect "$IMAGE" >/dev/null
 
 RUN_ROOT="$(mktemp -d /tmp/agent-skills-benchmark-run.XXXXXX)"
@@ -78,15 +81,19 @@ render_prompt() {
   printf '%s' "$template"
 }
 
+now_ms() {
+  python3 -c 'import time; print(time.monotonic_ns() // 1_000_000)'
+}
+
 measure_lane() {
   local case_name="$1"
   local lane="$2"
   local case_state="$3"
   local repetition="$4"
   local entry repo_dir tea_home pr_url prompt skill_name network fixture_input
-  local events_file stderr_file start_ns end_ns wall_ms exit_code
+  local events_file stderr_file start_ms end_ms wall_ms exit_code
   local thread_id final_message tool_calls command_calls usage failed_events
-  local mounts
+  local mounts model_args
 
   entry="$(jq -c '.entries[0]' "$case_state/fixture.json")"
   repo_dir="$(jq -r '.repo_dir' <<<"$entry")"
@@ -95,6 +102,7 @@ measure_lane() {
   fixture_input="$(jq -c '.fixture_input' <<<"$entry")"
   network="$(jq -r '.network' "$case_state/fixture.json")"
   prompt="$(render_prompt "$case_name" "$lane" "$pr_url")"
+  prompt+=" For this controlled benchmark, keep the current model and reasoning settings in all workers; do not switch models."
   skill_name="$(jq -r --arg case "$case_name" \
     '.cases[] | select(.name == $case) | .skill' "$CASES_FILE")"
   events_file="$RUN_ROOT/$case_name-r$repetition-$lane.jsonl"
@@ -109,22 +117,26 @@ measure_lane() {
     mounts+=(--mount "type=bind,src=$ROOT/skills/$skill_name,dst=/opt/benchmark-skill,readonly")
   fi
 
+  model_args=(--model "$MODEL")
+  if [[ -n "$REASONING_EFFORT" ]]; then
+    model_args+=(--config "model_reasoning_effort=\"$REASONING_EFFORT\"")
+  fi
+
   printf 'running case=%s repetition=%s/%s lane=%s model=%s effort=%s\n' \
     "$case_name" "$repetition" "$REPETITIONS" "$lane" "$MODEL" \
     "$REASONING_EFFORT" >&2
-  start_ns="$(date +%s%N)"
+  start_ms="$(now_ms)"
   set +e
   docker run --rm --network "$network" \
     --tmpfs "/run/codex-benchmark:rw,exec,nosuid,nodev,uid=$(id -u),gid=$(id -g),mode=0700" \
     "${mounts[@]}" \
     "$IMAGE" \
-    --model "$MODEL" \
-    --config "model_reasoning_effort=\"$REASONING_EFFORT\"" \
+    "${model_args[@]}" \
     "$prompt" >"$events_file" 2>"$stderr_file"
   exit_code=$?
   set -e
-  end_ns="$(date +%s%N)"
-  wall_ms=$(((end_ns - start_ns) / 1000000))
+  end_ms="$(now_ms)"
+  wall_ms=$((end_ms - start_ms))
 
   thread_id="$(jq -sr '[.[] | select(.type == "thread.started") | .thread_id] | last // ""' \
     "$events_file")"

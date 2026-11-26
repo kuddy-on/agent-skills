@@ -17,8 +17,11 @@ for command in python3 ruff shellcheck shfmt; do
   fi
 done
 
-mapfile -d '' shell_files < <(
-  find scripts skills tests -type f -name '*.sh' -print0 | sort -z
+shell_files=()
+while IFS= read -r -d '' file; do
+  shell_files+=("$file")
+done < <(
+  python3 -c 'import pathlib, sys; [sys.stdout.write(f"{p}\0") for p in sorted(p for r in ("scripts", "skills", "tests") for p in pathlib.Path(r).rglob("*.sh") if p.is_file())]'
 )
 
 ruff format --check .

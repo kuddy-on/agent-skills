@@ -7,10 +7,13 @@ Each reusable skill lives in `skills/<skill-name>/`. A skill must provide a
 agent-facing metadata belongs in `agents/`. Keep the three Gitea skills
 independently installable.
 
-Shared Python unit tests are in `tests/test_gitea_scripts.py`. The isolated,
-Docker-backed Gitea scenario is `tests/integration/run.sh`; benchmark fixtures
-live under `tests/benchmark/`. Repository policy and user documentation are in
-the root Markdown files and `.github/`.
+Python unit tests live under `tests/test_*.py` (script behavior in
+`tests/test_gitea_scripts.py`, layout checks in `tests/test_skill_layout.py`,
+Release Please checks in `tests/test_release_please.py`, and benchmark checks
+in `tests/test_benchmark_verification.py`). The isolated, Docker-backed Gitea
+scenario is `tests/integration/run.sh`; benchmark fixtures live under
+`tests/benchmark/`. Repository policy and user documentation are in the root
+Markdown files and `.github/`.
 
 ## Build, Test, and Development Commands
 
@@ -57,10 +60,10 @@ coverage is expected.
 
 ## Commit & Pull Request Guidelines
 
-History currently contains only an initial, concise Chinese commit, so no firm
-commit convention is established. Prefer short imperative summaries;
-Conventional Commit form is recognized by the tools, for example
-`fix(merge): reject a changed PR head`.
+Use Conventional Commits with short imperative summaries because Release Please
+derives versions and changelogs from commit history on `main` (for example
+`fix(merge): reject a changed PR head`, `feat(release): add tag prefix option`,
+or `!`/`BREAKING CHANGE` for breaking changes).
 
 Keep pull requests focused. Explain what changed and why, list validation, and
 link relevant issues. Add tests for behavior changes. Update both `README.md`
