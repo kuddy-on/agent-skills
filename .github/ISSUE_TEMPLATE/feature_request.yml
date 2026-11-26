@@ -10,6 +10,7 @@ body:
         - gitea-review
         - gitea-merge
         - gitea-release
+        - organize-workspace
         - New skill
         - Repository tooling or documentation
     validations:

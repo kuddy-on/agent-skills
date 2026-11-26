@@ -6,7 +6,7 @@ Open a Question issue and include:
 
 - the skill name
 - the agent runtime and operating system
-- Python and Tea versions
+- Python and Tea versions, when applicable
 - the command or user request that triggered the skill
 - sanitized output and the expected behavior
 
@@ -15,7 +15,8 @@ and personal information before posting.
 
 ## Bugs and feature requests
 
-Use the Bug Report or Feature Request form. Reproducible examples should use a
+Use the Bug Report or Feature Request form. Reproduce workspace issues in a
+temporary workspace with sanitized fixtures. Gitea examples should use a
 temporary Gitea instance rather than a production repository.
 
 ## Security issues
