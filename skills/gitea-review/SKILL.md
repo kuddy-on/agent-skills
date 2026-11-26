@@ -1,6 +1,6 @@
 ---
 name: gitea-review
-description: Review or re-review Gitea pull requests from `/review` commands or Gitea `/pulls/NUMBER` URLs, using Tea/Gitea API only, then submit and verify a formal review. Isolate each PR in one reusable sub-agent and route its reasoning effort by change size.
+description: Review or re-review Gitea pull requests from `/review` commands or Gitea `/pulls/NUMBER` URLs, using Tea/Gitea API only, then submit and verify a formal review. Isolate each PR in one reusable sub-agent and select an available model by capability tier.
 ---
 
 # Review Gitea PR
@@ -22,16 +22,17 @@ result. Do not inspect the PR, diff, CI, Issues, or repeat worker progress.
    <skill-dir>/scripts/review_pr.py classify <PR_URL>
    ```
 
-   Read only `pr.head`, `stats`, and `review_profile`. Classification uses
+   Read only `login`, `pr.head`, `stats`, and `review_profile`. Classification uses
    additions plus deletions: `fast` is at most 20 files/800 changed lines/2
    high-risk files; `medium` is at most 50/3,000/10; anything larger is
    `large`.
-3. For a new PR, spawn exactly one worker with no inherited conversation and
+3. Read `review_profile.worker.capability_tier` and select the worker model
+   using the runtime policy below. The profile specifies a capability tier,
+   not a model identifier or a provider-specific reasoning setting.
+4. For a new PR, spawn exactly one worker with no inherited conversation and
    the marker `PR_REVIEW_WORKER`. Pass only the PR URL, selected Tea login when
-   applicable, classified head/lane, and the user's review requirement.
-4. Use the exact `review_profile.worker.model` and
-   `review_profile.worker.reasoning_effort`: fast or focused re-review uses
-   `gpt-5.6-sol`/`medium`, medium uses `high`, and large uses `xhigh`.
+   applicable, classified head/lane/tier, runtime model selection, and the
+   user's review requirement.
 5. Wait once and return the worker result without duplicating its analysis.
    Reuse the same worker for later reviews of this PR. If it is unavailable,
    create one replacement and reconstruct only this PR from Gitea.
@@ -39,6 +40,31 @@ result. Do not inspect the PR, diff, CI, Issues, or repeat worker progress.
 If sub-agents are unavailable, disclose that isolation is unavailable and run
 worker mode locally. When the prompt contains `PR_REVIEW_WORKER`, skip routing
 and delegation and execute the worker workflow below.
+
+## Select a model at runtime
+
+| Tier | Review scope | Capability needed |
+| --- | --- | --- |
+| `standard` | Fast or focused re-review | Reliable code review and instruction following for a bounded change. |
+| `advanced` | Medium changes | Strong reasoning across files, contracts, and failure paths. |
+| `highest` | Large changes | The strongest available code-review and reasoning capability for complex, cross-cutting changes. |
+
+Choose autonomously from the models exposed by the current runtime, using
+their capability descriptions and supported options. Respect explicit user
+model choices, budget, and latency constraints. These tiers are relative
+capability requirements, not permanent mappings to vendors, model families,
+release dates, prices, or reasoning-effort names.
+
+Inherit the current model when it meets the tier. Otherwise select a suitable
+available model, without inventing an identifier or changing global settings.
+If the runtime supports reasoning controls, choose a supported setting for
+the task; otherwise retain its default. When the catalog is unavailable,
+inherit the current model and disclose that the tier could not be verified.
+If constraints prevent meeting the tier, state the limitation rather than
+silently claiming an equivalent choice. Pass the selected model (or inherited
+selection) and reasoning setting to the worker handoff. On reuse, reassess
+whether the worker still meets the tier; if a change is needed but unsupported,
+replace it using the PR reconstruction procedure above.
 
 ## Prepare once at the worker
 

@@ -17,14 +17,28 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 PAGE_SIZE = 50
 MAX_FILE_PAGES = 8
+MAX_API_PAGES = 20
+NON_SUBMITTED_REVIEW_STATES = frozenset({"PENDING", "REQUEST_REVIEW"})
+GIT_C_ESCAPES: dict[str, int] = {
+    "a": 0x07,
+    "b": 0x08,
+    "f": 0x0C,
+    "n": 0x0A,
+    "r": 0x0D,
+    "t": 0x09,
+    "v": 0x0B,
+    "\\": 0x5C,
+    '"': 0x22,
+}
 NETWORK_ERRORS = (
     "connection refused",
     "connection reset",
@@ -46,24 +60,57 @@ class PullRef:
     repo: str
     index: int
     url: str
+    port: int | None = None
 
     @property
     def slug(self) -> str:
         return f"{self.owner}/{self.repo}"
 
 
+def effective_http_port(parsed) -> int | None:
+    if parsed.scheme not in {"http", "https"}:
+        return None
+    if parsed.port is not None:
+        return parsed.port
+    return 443 if parsed.scheme == "https" else 80
+
+
+def login_matches_host(
+    profile: dict[str, Any], host: str, http_port: int | None = None
+) -> bool:
+    parsed = urlparse(str(profile.get("url") or ""))
+    url_host = (parsed.hostname or "").lower()
+    ssh_host = str(profile.get("ssh_host") or "").lower()
+    if http_port is not None:
+        if host == url_host and effective_http_port(parsed) == http_port:
+            return True
+        return not url_host and host == ssh_host
+    return host == url_host or host == ssh_host
+
+
 def parse_pull_url(value: str) -> PullRef:
     parsed = urlparse(value)
-    match = re.fullmatch(r"/([^/]+)/([^/]+)/pulls/(\d+)/?", parsed.path)
+    match = re.fullmatch(
+        r"(?P<prefix>(?:/[^/]+)*)/(?P<owner>[^/]+)/(?P<repo>[^/]+)"
+        r"/pulls/(?P<index>\d+)(?:/(?:files|commits))?/?",
+        parsed.path,
+    )
     if parsed.scheme not in {"http", "https"} or not parsed.netloc or not match:
         raise ValueError(f"不是有效的 Gitea PR 地址: {value}")
-    owner, repo, index = match.groups()
+    prefix = match.group("prefix") or ""
+    owner = match.group("owner")
+    repo = match.group("repo")
+    index = int(match.group("index"))
+    canonical_url = (
+        f"{parsed.scheme}://{parsed.netloc}{prefix}/{owner}/{repo}/pulls/{index}"
+    )
     return PullRef(
         (parsed.hostname or parsed.netloc).lower(),
         owner,
         repo,
-        int(index),
-        value.rstrip("/"),
+        index,
+        canonical_url,
+        effective_http_port(parsed),
     )
 
 
@@ -106,11 +153,7 @@ def resolve_login(pull: PullRef, requested: str | None) -> str:
         )
         if selected is None:
             raise RuntimeError(f"Tea login {requested!r} is not configured")
-        profile_hosts = {
-            (urlparse(str(selected.get("url") or "")).hostname or "").lower(),
-            str(selected.get("ssh_host") or "").lower(),
-        }
-        if pull.host not in profile_hosts:
+        if not login_matches_host(selected, pull.host, pull.port):
             raise RuntimeError(
                 f"Tea login {requested!r} does not match PR host {pull.host}"
             )
@@ -120,15 +163,12 @@ def resolve_login(pull: PullRef, requested: str | None) -> str:
             str(profile.get("name"))
             for profile in profiles
             if profile.get("name")
-            and (
-                pull.host
-                == (urlparse(str(profile.get("url") or "")).hostname or "").lower()
-                or pull.host == str(profile.get("ssh_host") or "").lower()
-            )
+            and login_matches_host(profile, pull.host, pull.port)
         ]
 
     accessible = []
     errors: dict[str, str] = {}
+    network_error: str | None = None
     endpoint = f"/repos/{pull.slug}"
     for login in candidates:
         process = subprocess.run(
@@ -141,10 +181,7 @@ def resolve_login(pull: PullRef, requested: str | None) -> str:
         detail = process.stderr.strip() or process.stdout.strip()
         if process.returncode:
             if is_network_error(detail):
-                raise RuntimeError(
-                    "network_access_required: rerun the same command with sandbox "
-                    f"network escalation: {detail}"
-                )
+                network_error = network_error or detail
             errors[login] = detail
             continue
         try:
@@ -157,11 +194,11 @@ def resolve_login(pull: PullRef, requested: str | None) -> str:
             continue
         message = str(repository.get("message") or "")
         if message and is_network_error(message):
-            raise RuntimeError(
-                "network_access_required: rerun the same command with sandbox "
-                f"network escalation: {message}"
-            )
-        if repository.get("full_name") == pull.slug:
+            network_error = network_error or message
+            errors[login] = message
+            continue
+        full_name = str(repository.get("full_name") or "")
+        if full_name.casefold() == pull.slug.casefold():
             accessible.append(login)
         else:
             errors[login] = str(repository.get("message") or "repository not found")
@@ -172,6 +209,11 @@ def resolve_login(pull: PullRef, requested: str | None) -> str:
             "pass --login"
         )
     if not accessible:
+        if network_error is not None:
+            raise RuntimeError(
+                "network_access_required: rerun the same command with sandbox "
+                f"network escalation: {network_error}"
+            )
         detail = "; ".join(f"{name}: {error}" for name, error in errors.items())
         raise RuntimeError(
             f"no Tea login can access {pull.slug}; pass --login. {detail}"
@@ -237,11 +279,52 @@ class TeaClient:
             )
         return value
 
+    def api_paginated(
+        self,
+        endpoint: str,
+        *,
+        page_size: int = PAGE_SIZE,
+        max_pages: int = MAX_API_PAGES,
+    ) -> list[Any]:
+        separator = "&" if "?" in endpoint else "?"
+        items: list[Any] = []
+        for page in range(1, max_pages + 1):
+            batch = self.api_json(
+                f"{endpoint}{separator}page={page}&limit={page_size}"
+            )
+            if not isinstance(batch, list):
+                raise RuntimeError(f"Gitea 返回的列表格式异常: {endpoint}")
+            items.extend(batch)
+            if len(batch) < page_size:
+                return items
+        raise RuntimeError(
+            f"Gitea 列表分页超过上限 {page_size * max_pages}: {endpoint}"
+        )
+
     def raw_optional(self, path: str, ref: str) -> str | None:
-        endpoint = f"/repos/{self.pull.slug}/raw/{path}?ref={ref}"
-        output = self.api_text(endpoint)
-        if output.lstrip().startswith('{"message":"not found"'):
+        encoded_path = quote(path.lstrip("/"), safe="/")
+        encoded_ref = quote(ref, safe="")
+        endpoint = f"/repos/{self.pull.slug}/raw/{encoded_path}?ref={encoded_ref}"
+        try:
+            output = self.api_text(endpoint)
+        except RuntimeError as exc:
+            if "network_access_required" in str(exc):
+                raise
             return None
+        stripped = output.lstrip()
+        if stripped.startswith("{"):
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict) and parsed.get("message"):
+                message = str(parsed["message"])
+                if is_network_error(message):
+                    raise RuntimeError(
+                        "network_access_required: rerun the same command with sandbox "
+                        f"network escalation: {message}"
+                    )
+                return None
         return output
 
 
@@ -249,35 +332,170 @@ def pr_endpoint(pull: PullRef) -> str:
     return f"/repos/{pull.slug}/pulls/{pull.index}"
 
 
+def strip_non_reference_text(body: str) -> str:
+    cleaned = re.sub(r"```.*?```", " ", body, flags=re.DOTALL)
+    cleaned = re.sub(r"`[^`]*`", " ", cleaned)
+    cleaned = re.sub(r"https?://\S+", " ", cleaned)
+    return cleaned
+
+
 def extract_issue_refs(body: str, current: PullRef) -> list[tuple[str, str, int]]:
+    cleaned = strip_non_reference_text(body)
     refs: set[tuple[str, str, int]] = set()
     for owner, repo, number in re.findall(
-        r"(?<![\w.-])([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)#(\d+)", body
+        r"(?<![\w./-])([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)#([1-9]\d*)\b",
+        cleaned,
     ):
         refs.add((owner, repo, int(number)))
-    for number in re.findall(r"(?<![\w/])#(\d+)", body):
+    without_cross_repo = re.sub(
+        r"(?<![\w./-])[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[1-9]\d*\b",
+        " ",
+        cleaned,
+    )
+    for number in re.findall(r"(?<![\w/#-])#([1-9]\d*)\b", without_cross_repo):
         refs.add((current.owner, current.repo, int(number)))
     return sorted(refs)
 
 
+def unescape_git_path(token: str) -> str:
+    value = token.strip()
+    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+        inner = value[1:-1]
+        raw = bytearray()
+        index = 0
+        length = len(inner)
+        while index < length:
+            ch = inner[index]
+            if ch != "\\" or index + 1 >= length:
+                raw.extend(ch.encode("utf-8"))
+                index += 1
+                continue
+            nxt = inner[index + 1]
+            if nxt in GIT_C_ESCAPES:
+                raw.append(GIT_C_ESCAPES[nxt])
+                index += 2
+                continue
+            octal = inner[index + 1 : index + 4]
+            if len(octal) == 3 and all(digit in "01234567" for digit in octal):
+                raw.append(int(octal, 8))
+                index += 4
+                continue
+            raw.extend(nxt.encode("utf-8"))
+            index += 2
+        value = raw.decode("utf-8", errors="replace")
+    return value
+
+
+def strip_diff_prefix(path: str) -> str:
+    if path.startswith(("a/", "b/")):
+        return path[2:]
+    return path
+
+
+def parse_header_path(raw_value: str) -> str | None:
+    value = raw_value.rstrip("\r\n")
+    if value.endswith("\t"):
+        value = value[:-1]
+    if not value or value == "/dev/null":
+        return None
+    return strip_diff_prefix(unescape_git_path(value))
+
+
+def parse_diff_git_line(line: str) -> str | None:
+    rest = line[len("diff --git ") :].rstrip("\r\n")
+    if not rest:
+        return None
+    if rest.startswith('"') or ' "' in rest:
+        tokens: list[str] = []
+        index = 0
+        length = len(rest)
+        while index < length:
+            while index < length and rest[index] == " ":
+                index += 1
+            if index >= length:
+                break
+            if rest[index] == '"':
+                start = index
+                index += 1
+                while index < length:
+                    if rest[index] == "\\" and index + 1 < length:
+                        index += 2
+                        continue
+                    if rest[index] == '"':
+                        index += 1
+                        break
+                    index += 1
+                tokens.append(rest[start:index])
+            else:
+                start = index
+                while index < length and rest[index] != " ":
+                    index += 1
+                tokens.append(rest[start:index])
+        if len(tokens) >= 2:
+            return strip_diff_prefix(unescape_git_path(tokens[-1]))
+        return None
+
+    if rest.startswith("a/"):
+        marker = " b/"
+        search_from = 2
+        while True:
+            pos = rest.find(marker, search_from)
+            if pos == -1:
+                break
+            left = rest[2:pos]
+            right = rest[pos + len(marker) :]
+            if left == right:
+                return right
+            search_from = pos + 1
+        pos = rest.rfind(marker)
+        if pos != -1:
+            return rest[pos + len(marker) :]
+    parts = rest.split(" ")
+    if len(parts) == 2:
+        return strip_diff_prefix(parts[1])
+    return None
+
+
+def section_path(lines: list[str]) -> str | None:
+    deleted_path: str | None = None
+    for line in lines[1:]:
+        if line.startswith("+++ "):
+            target = parse_header_path(line[4:])
+            if target is not None:
+                return target
+        elif line.startswith("rename to "):
+            target = parse_header_path(line[len("rename to ") :])
+            if target is not None:
+                return target
+        elif line.startswith("copy to "):
+            target = parse_header_path(line[len("copy to ") :])
+            if target is not None:
+                return target
+        elif line.startswith("--- ") and deleted_path is None:
+            deleted_path = parse_header_path(line[4:])
+        elif line.startswith("@@ "):
+            break
+    if deleted_path is not None:
+        return deleted_path
+    return parse_diff_git_line(lines[0])
+
+
 def split_diff(diff: str) -> dict[str, str]:
-    sections: dict[str, list[str]] = {}
-    current: str | None = None
+    raw_sections: list[list[str]] = []
+    current_lines: list[str] | None = None
     for line in diff.splitlines(keepends=True):
         if line.startswith("diff --git "):
-            try:
-                fields = shlex.split(line.rstrip("\n"))
-                current = fields[3]
-                if current.startswith("b/"):
-                    current = current[2:]
-            except (IndexError, ValueError):
-                current = None
-            if current is not None:
-                sections[current] = [line]
+            current_lines = [line]
+            raw_sections.append(current_lines)
             continue
-        if current is not None:
-            sections[current].append(line)
-    return {path: "".join(lines) for path, lines in sections.items()}
+        if current_lines is not None:
+            current_lines.append(line)
+    sections: dict[str, str] = {}
+    for lines in raw_sections:
+        path = section_path(lines)
+        if path is not None:
+            sections[path] = "".join(lines)
+    return sections
 
 
 def risk_tags(path: str) -> list[str]:
@@ -330,6 +548,7 @@ def compact_review(review: dict[str, Any]) -> dict[str, Any]:
         "id": review.get("id"),
         "reviewer": reviewer_name,
         "state": review.get("state"),
+        "dismissed": bool(review.get("dismissed")),
         "commit_id": review.get("commit_id") or review.get("commitId"),
         "submitted_at": review.get("submitted_at") or review.get("created_at"),
         "body": review.get("body") or "",
@@ -339,8 +558,19 @@ def compact_review(review: dict[str, Any]) -> dict[str, Any]:
 def latest_own_review(
     reviews: list[dict[str, Any]], reviewer_login: str
 ) -> dict[str, Any] | None:
-    own = [review for review in reviews if review.get("reviewer") == reviewer_login]
-    return own[-1] if own else None
+    own: list[tuple[int, int, dict[str, Any]]] = []
+    for index, review in enumerate(reviews):
+        if review.get("reviewer") != reviewer_login:
+            continue
+        if review.get("dismissed"):
+            continue
+        state = str(review.get("state") or "").upper()
+        if state in NON_SUBMITTED_REVIEW_STATES:
+            continue
+        own.append((int(review.get("id") or 0), index, review))
+    if not own:
+        return None
+    return max(own, key=lambda item: (item[0], item[1]))[2]
 
 
 def bounded_review_history(
@@ -365,7 +595,7 @@ def choose_review_profile(
             "patch_mode": "none",
             "max_supplemental_rounds": 1,
             "size": "small",
-            "worker": {"model": "gpt-5.6-sol", "reasoning_effort": "medium"},
+            "worker": {"capability_tier": "standard"},
         }
 
     files = int(stats.get("files") or 0)
@@ -378,7 +608,7 @@ def choose_review_profile(
             "patch_mode": "review-set",
             "max_supplemental_rounds": 1,
             "size": "small",
-            "worker": {"model": "gpt-5.6-sol", "reasoning_effort": "medium"},
+            "worker": {"capability_tier": "standard"},
         }
 
     if files <= 50 and changed_lines <= 3_000 and high_risk_files <= 10:
@@ -388,7 +618,7 @@ def choose_review_profile(
             "patch_mode": "high-risk",
             "max_supplemental_rounds": 1,
             "size": "medium",
-            "worker": {"model": "gpt-5.6-sol", "reasoning_effort": "high"},
+            "worker": {"capability_tier": "advanced"},
         }
 
     return {
@@ -397,7 +627,7 @@ def choose_review_profile(
         "patch_mode": "high-risk",
         "max_supplemental_rounds": 1,
         "size": "large",
-        "worker": {"model": "gpt-5.6-sol", "reasoning_effort": "xhigh"},
+        "worker": {"capability_tier": "highest"},
     }
 
 
@@ -513,11 +743,22 @@ def fetch_issues(
     if not refs:
         return []
 
-    def fetch(ref: tuple[str, str, int]) -> dict[str, Any]:
+    def fetch(ref: tuple[str, str, int]) -> dict[str, Any] | None:
         owner, repo, number = ref
-        scoped = PullRef(pull.host, owner, repo, number, pull.url)
+        scoped = PullRef(pull.host, owner, repo, number, pull.url, pull.port)
         client = TeaClient(scoped, login)
-        value = client.api_json(f"/repos/{owner}/{repo}/issues/{number}")
+        try:
+            value = client.api_json(f"/repos/{owner}/{repo}/issues/{number}")
+        except FileNotFoundError:
+            return None
+        except RuntimeError as exc:
+            if "network_access_required" in str(exc):
+                raise
+            return None
+        if not isinstance(value, dict) or (
+            value.get("message") and not value.get("title")
+        ):
+            return None
         return {
             "repo": f"{owner}/{repo}",
             "number": number,
@@ -529,20 +770,51 @@ def fetch_issues(
         }
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(refs))) as pool:
-        return list(pool.map(fetch, refs))
+        results = list(pool.map(fetch, refs))
+    return [item for item in results if item is not None]
+
+
+def is_safe_repo_markdown_path(value: str) -> bool:
+    if not value or value.startswith(("http://", "https://", "/")):
+        return False
+    if any(ch in value for ch in (" ", "\t", "\n", "\r", "\\", "#", "?")):
+        return False
+    parts = PurePosixPath(value).parts
+    return bool(parts) and ".." not in parts
 
 
 def instruction_candidates(files: list[dict[str, Any]], root_text: str) -> list[str]:
     paths = {"AGENTS.md"}
     for file in files:
         path = str(file.get("filename") or "")
-        parts = Path(path).parts[:-1]
+        parts = PurePosixPath(path).parts[:-1]
         for index in range(1, len(parts) + 1):
-            paths.add(str(Path(*parts[:index]) / "AGENTS.md"))
+            paths.add(str(PurePosixPath(*parts[:index]) / "AGENTS.md"))
     for value in re.findall(r"`([^`]+\.md)`", root_text):
-        if not value.startswith(("http://", "https://", "/")):
+        if is_safe_repo_markdown_path(value):
             paths.add(value)
     return sorted(paths)[:30]
+
+
+def normalize_file_entry(
+    item: dict[str, Any], *, patch_chars: int | None = None
+) -> dict[str, Any]:
+    path = str(item.get("filename") or "")
+    additions = int(item.get("additions") or 0)
+    deletions = int(item.get("deletions") or 0)
+    changes = int(item.get("changes") or (additions + deletions))
+    normalized: dict[str, Any] = {
+        "filename": path,
+        "status": item.get("status"),
+        "additions": additions,
+        "deletions": deletions,
+        "changes": changes,
+        "risk_tags": risk_tags(path),
+    }
+    if patch_chars is not None:
+        normalized["patch_chars"] = patch_chars
+    normalized["risk_score"] = file_score(normalized)
+    return normalized
 
 
 def cache_dir_for(pull: PullRef, head_sha: str) -> Path:
@@ -576,17 +848,7 @@ def classify_pull(pull: PullRef, login: str | None) -> dict[str, Any]:
     head_sha = pr["head"]["sha"]
     if not head_sha:
         raise RuntimeError("PR 没有 head SHA")
-    normalized_files = [
-        {
-            "filename": item.get("filename") or "",
-            "additions": int(item.get("additions") or 0),
-            "deletions": int(item.get("deletions") or 0),
-            "risk_tags": risk_tags(str(item.get("filename") or "")),
-        }
-        for item in files
-    ]
-    for item in normalized_files:
-        item["risk_score"] = file_score(item)
+    normalized_files = [normalize_file_entry(item) for item in files]
     stats = {
         "files": len(normalized_files),
         "additions": sum(item["additions"] for item in normalized_files),
@@ -599,6 +861,7 @@ def classify_pull(pull: PullRef, login: str | None) -> dict[str, Any]:
     }
     own_review = latest_own_review(reviews, reviewer_login)
     return {
+        "login": login,
         "pr": {"url": pr["url"], "head": pr["head"]},
         "review_profile": choose_review_profile(stats, own_review, head_sha),
         "stats": stats,
@@ -606,13 +869,23 @@ def classify_pull(pull: PullRef, login: str | None) -> dict[str, Any]:
     }
 
 
-def write_json(path: Path, value: Any) -> None:
+def write_text_atomic(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8"
+    fd, tmp_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
     )
-    temporary.replace(path)
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        tmp_path.replace(path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def write_json(path: Path, value: Any) -> None:
+    write_text_atomic(path, json.dumps(value, ensure_ascii=False, indent=2))
 
 
 def load_json(path: Path) -> Any:
@@ -641,12 +914,16 @@ def normalize_pr(value: dict[str, Any], pull: PullRef) -> dict[str, Any]:
 
 
 def fetch_reviews(client: TeaClient) -> list[dict[str, Any]]:
-    value = client.api_json(
-        f"/repos/{client.pull.slug}/pulls/{client.pull.index}/reviews?limit=50"
+    value = client.api_paginated(
+        f"/repos/{client.pull.slug}/pulls/{client.pull.index}/reviews"
     )
-    if not isinstance(value, list):
-        raise RuntimeError("评审列表格式异常")
     return [compact_review(review) for review in value]
+
+
+def fetch_commits(client: TeaClient) -> list[dict[str, Any]]:
+    return client.api_paginated(
+        f"/repos/{client.pull.slug}/pulls/{client.pull.index}/commits"
+    )
 
 
 def fetch_compare(
@@ -674,6 +951,17 @@ def fetch_compare(
     }
 
 
+def cache_matches_base(bundle: dict[str, Any], pr: dict[str, Any]) -> bool:
+    cached_base = (bundle.get("pr") or {}).get("base") or {}
+    current_base = pr.get("base") or {}
+    return bool(
+        current_base.get("ref") is not None
+        and current_base.get("sha") is not None
+        and cached_base.get("ref") == current_base.get("ref")
+        and cached_base.get("sha") == current_base.get("sha")
+    )
+
+
 def build_snapshot(pull: PullRef, login: str | None, refresh: bool) -> dict[str, Any]:
     client = TeaClient(pull, login)
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
@@ -693,7 +981,17 @@ def build_snapshot(pull: PullRef, login: str | None, refresh: bool) -> dict[str,
     target = cache_dir_for(pull, head_sha)
     bundle_path = target / "bundle.json"
     diff_path = target / "full.diff"
-    cached = bundle_path.exists() and diff_path.exists() and not refresh
+
+    cached = False
+    bundle: dict[str, Any] = {}
+    if bundle_path.exists() and diff_path.exists() and not refresh:
+        try:
+            candidate = load_json(bundle_path)
+        except (OSError, json.JSONDecodeError):
+            candidate = None
+        if isinstance(candidate, dict) and cache_matches_base(candidate, pr):
+            bundle = candidate
+            cached = True
 
     issue_refs = extract_issue_refs(pr["body"], pull)
     if cached:
@@ -702,7 +1000,6 @@ def build_snapshot(pull: PullRef, login: str | None, refresh: bool) -> dict[str,
             issues_future = pool.submit(fetch_issues, login, issue_refs, pull)
             reviews = reviews_future.result()
             issues = issues_future.result()
-        bundle = load_json(bundle_path)
         bundle["pr"] = pr
         bundle["reviews"] = bounded_review_history(reviews, reviewer_login)
         bundle["issues"] = issues
@@ -713,14 +1010,14 @@ def build_snapshot(pull: PullRef, login: str | None, refresh: bool) -> dict[str,
                 for item in bundle.get("files", [])
             )
         bundle["schema_version"] = 2
-        bundle["cache"]["reused_code_snapshot"] = True
+        cache_meta = bundle.setdefault("cache", {})
+        cache_meta["reused_code_snapshot"] = True
+        cache_meta["base_ref"] = pr["base"].get("ref")
+        cache_meta["base_sha"] = pr["base"].get("sha")
     else:
         diff_endpoint = f"/repos/{pull.slug}/pulls/{pull.index}.diff"
         with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-            commits_future = pool.submit(
-                client.api_json,
-                f"/repos/{pull.slug}/pulls/{pull.index}/commits?limit=100",
-            )
+            commits_future = pool.submit(fetch_commits, client)
             reviews_future = pool.submit(fetch_reviews, client)
             issues_future = pool.submit(fetch_issues, login, issue_refs, pull)
             files_future = pool.submit(fetch_file_pages, client)
@@ -736,21 +1033,13 @@ def build_snapshot(pull: PullRef, login: str | None, refresh: bool) -> dict[str,
             root_instruction = root_instruction_future.result() or ""
 
         patches = split_diff(full_diff)
-        files = []
-        for item in files_raw:
-            path = item.get("filename") or ""
-            normalized = {
-                "filename": path,
-                "status": item.get("status"),
-                "additions": item.get("additions") or 0,
-                "deletions": item.get("deletions") or 0,
-                "changes": item.get("changes")
-                or (item.get("additions") or 0) + (item.get("deletions") or 0),
-                "risk_tags": risk_tags(path),
-                "patch_chars": len(patches.get(path, "")),
-            }
-            normalized["risk_score"] = file_score(normalized)
-            files.append(normalized)
+        files = [
+            normalize_file_entry(
+                item,
+                patch_chars=len(patches.get(str(item.get("filename") or ""), "")),
+            )
+            for item in files_raw
+        ]
         files.sort(key=lambda item: (-item["risk_score"], item["filename"]))
 
         candidates = instruction_candidates(files, root_instruction)
@@ -799,10 +1088,11 @@ def build_snapshot(pull: PullRef, login: str | None, refresh: bool) -> dict[str,
                 "diff": str(diff_path),
                 "reused_code_snapshot": False,
                 "head_sha256": hashlib.sha256(head_sha.encode()).hexdigest(),
+                "base_ref": pr["base"].get("ref"),
+                "base_sha": pr["base"].get("sha"),
             },
         }
-        target.mkdir(parents=True, exist_ok=True)
-        diff_path.write_text(full_diff, encoding="utf-8")
+        write_text_atomic(diff_path, full_diff)
 
     bundle["reviewer_login"] = reviewer_login
     own_review = latest_own_review(bundle.get("reviews", []), reviewer_login)
@@ -818,12 +1108,22 @@ def build_snapshot(pull: PullRef, login: str | None, refresh: bool) -> dict[str,
     bundle["review_profile"] = choose_review_profile(
         bundle.get("stats", {}), own_review, head_sha
     )
+    script_cmd = shlex.quote(str(Path(__file__).resolve()))
+    quoted_url = shlex.quote(pull.url)
+    login_arg = f" --login {shlex.quote(login)}" if login else ""
     bundle["commands"] = {
-        "show_review_set": f"python3 review_pr.py show {pull.url} --review-set --max-chars 50000",
-        "show_high_risk": f"python3 review_pr.py show {pull.url} --risk high",
-        "show_files": f"python3 review_pr.py show {pull.url} --files PATH [PATH ...]",
+        "show_review_set": (
+            f"{script_cmd} show {quoted_url} --head {head_sha} "
+            "--review-set --max-chars 50000"
+        ),
+        "show_high_risk": (
+            f"{script_cmd} show {quoted_url} --head {head_sha} --risk high"
+        ),
+        "show_files": (
+            f"{script_cmd} show {quoted_url} --head {head_sha} --files PATH [PATH ...]"
+        ),
         "submit": (
-            f"python3 review_pr.py submit {pull.url} --expected-head {head_sha} "
+            f"{script_cmd} submit {quoted_url}{login_arg} --expected-head {head_sha} "
             "--state approve|request-changes --body-file REVIEW.md"
         ),
     }
@@ -921,7 +1221,12 @@ def latest_cache_dir(pull: PullRef) -> Path:
 
 def show_cached(args: argparse.Namespace) -> None:
     pull = parse_pull_url(args.url)
-    target = latest_cache_dir(pull)
+    if getattr(args, "head", None):
+        target = cache_dir_for(pull, args.head)
+        if not (target / "bundle.json").is_file():
+            raise FileNotFoundError(f"没有指定 head 的缓存: {args.head}")
+    else:
+        target = latest_cache_dir(pull)
     bundle = load_json(target / "bundle.json")
     if args.instructions:
         for path, content in bundle.get("instructions", {}).items():
@@ -950,6 +1255,17 @@ def show_cached(args: argparse.Namespace) -> None:
             print(f"===== {path} (patch unavailable) =====")
             continue
         if emitted + len(patch) > args.max_chars:
+            if emitted == 0:
+                marker = (
+                    f"\n===== {path} truncated at {args.max_chars} chars; "
+                    "pass a larger --max-chars to view more =====\n"
+                )
+                if len(marker) < args.max_chars:
+                    fragment = patch[: args.max_chars - len(marker)] + marker
+                else:
+                    fragment = patch[: args.max_chars]
+                print(fragment, end="" if fragment.endswith("\n") else "\n")
+                break
             print(
                 f"===== output limited at {args.max_chars} chars; remaining files omitted ====="
             )
@@ -971,7 +1287,14 @@ def read_review_body(args: argparse.Namespace) -> str:
 def submit_review(args: argparse.Namespace) -> None:
     pull = parse_pull_url(args.url)
     client = TeaClient(pull, args.login)
-    pr = normalize_pr(client.api_json(pr_endpoint(pull)), pull)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        user_future = pool.submit(client.api_json, "/user")
+        pr_future = pool.submit(client.api_json, pr_endpoint(pull))
+        authenticated_user = user_future.result()
+        pr = normalize_pr(pr_future.result(), pull)
+    reviewer_login = str(
+        authenticated_user.get("login") or authenticated_user.get("username") or ""
+    )
     head_sha = pr["head"]["sha"]
     if head_sha != args.expected_head:
         raise RuntimeError(
@@ -990,38 +1313,35 @@ def submit_review(args: argparse.Namespace) -> None:
         )
         return
 
-    if args.state in {"approve", "request-changes"}:
-        action = "approve" if args.state == "approve" else "reject"
-        result = client.run(
-            "pulls",
-            action,
-            "--repo",
-            pull.slug,
-            *client.login_args(),
-            "--output",
-            "json",
-            str(pull.index),
-            body,
-        ).strip()
-    else:
-        result = client.run(
-            "api",
-            *client.login_args(),
-            "--repo",
-            pull.slug,
-            "--method",
-            "POST",
-            "--field",
-            f"body={body}",
-            "--field",
-            "event=COMMENT",
-            "--field",
-            f"commit_id={head_sha}",
-            f"/repos/{pull.slug}/pulls/{pull.index}/reviews",
-        ).strip()
+    event = {
+        "approve": "APPROVED",
+        "request-changes": "REQUEST_CHANGES",
+        "comment": "COMMENT",
+    }[args.state]
+    submit_client = TeaClient(pull, args.login, retries=0)
+    result = submit_client.run(
+        "api",
+        *submit_client.login_args(),
+        "--repo",
+        pull.slug,
+        "--method",
+        "POST",
+        "--field",
+        f"body={body}",
+        "--field",
+        f"event={event}",
+        "--field",
+        f"commit_id={head_sha}",
+        f"/repos/{pull.slug}/pulls/{pull.index}/reviews",
+    ).strip()
 
     reviews = fetch_reviews(client)
-    latest = reviews[-1] if reviews else None
+    latest = latest_own_review(reviews, reviewer_login) if reviewer_login else None
+    if latest is None and reviews:
+        latest = max(
+            reviews,
+            key=lambda item: int(item.get("id") or 0),
+        )
     print(
         json.dumps(
             {
@@ -1057,10 +1377,10 @@ def create_parser() -> argparse.ArgumentParser:
     classify = subparsers.add_parser("classify", help="只输出 head 和评审通道")
     classify.add_argument("url")
     classify.add_argument("--login", help="Tea 登录配置；默认自动选择唯一可访问账号")
-    classify.add_argument("--refresh", action="store_true", help="忽略同 head 缓存")
 
     show = subparsers.add_parser("show", help="从缓存输出选定 patch，不再请求网络")
     show.add_argument("url")
+    show.add_argument("--head", help="指定缓存的 head SHA；默认读取最新缓存")
     show.add_argument("--files", nargs="+")
     show.add_argument(
         "--review-set", action="store_true", help="输出小 PR 的完整有效代码集"

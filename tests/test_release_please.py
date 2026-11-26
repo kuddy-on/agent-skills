@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import json
+import re
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+SEMVER = re.compile(
+    r"^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)"
+    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+)
 
 
 class ReleasePleaseConfigurationTests(unittest.TestCase):
@@ -17,7 +23,7 @@ class ReleasePleaseConfigurationTests(unittest.TestCase):
         version = (ROOT / "version.txt").read_text(encoding="utf-8").strip()
 
         self.assertEqual(manifest, {".": version})
-        self.assertEqual(version, "0.0.0")
+        self.assertRegex(version, SEMVER)
 
     def test_root_package_uses_simple_release_type(self) -> None:
         config = json.loads(

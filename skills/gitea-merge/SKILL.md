@@ -45,7 +45,7 @@ An explicit user-selected strategy is authoritative.
 
 ## Enforce gates
 
-Require the PR to target the configured base branch, have no conflict, have successful CI, and have no outstanding request-changes review. Preserve unrelated working-tree changes. Request remote branch deletion atomically with the merge unless `--keep-branch` is set. If the feature branch is checked out with uncommitted changes, keep its local ref while still deleting the remote branch.
+Require the PR to be an ordinary non-draft PR targeting the configured base branch, have confirmed conflict-free mergeability, have successful CI, and have no outstanding request-changes review. Refuse Release Please PRs before merging. Preserve unrelated working-tree changes. Request remote branch deletion atomically with the merge unless `--keep-branch` is set or the source branch is protected. If the feature branch is checked out with uncommitted changes or in another linked worktree, keep its local ref.
 
 Return the JSON summary, including the selected strategy, evidence, merged commit SHA, PR URL, cleanup result, and stage durations. When publication is also requested, wait until Release Please has created or updated its release PR, then invoke `gitea-release` if that Skill is available.
 

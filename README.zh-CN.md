@@ -3,7 +3,7 @@
 [![Test](https://github.com/kuddy-on/agent-skills/actions/workflows/test.yml/badge.svg)](https://github.com/kuddy-on/agent-skills/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-一组可复用的 Agent Skills，用于审查、合并和发布托管在 Gitea 上的仓库。
+一组可复用的 Agent Skills，用于组织工作区，以及审查、合并和发布托管在 Gitea 上的仓库。
 
 [English](README.md)
 
@@ -14,13 +14,20 @@
 | `gitea-review` | 审查或复审 Gitea Pull Request，并提交正式 Review。 |
 | `gitea-merge` | 校验并合并普通 Pull Request；squash 标题兼容 Release Please，且默认删除已合并的特性分支。 |
 | `gitea-release` | 合并 Release Please Pull Request，并验证 Workflow、Tag 和 Gitea Release。 |
+| `organize-workspace` | 规划或盘点多项目与运维工作区、判断文件归属，并按授权执行目录整理。 |
 
-三个 Skill 均可独立安装和使用。`gitea-release` 不依赖 `gitea-merge`，并且只处理已经
+各 Skill 均可独立安装和使用。`gitea-release` 不依赖 `gitea-merge`，并且只处理已经
 存在的 Release Please Pull Request。
 
 `gitea-review` 会先根据元数据判断 PR 规模，再交给一个不继承当前对话且可复用的 worker。
-快速和聚焦复审使用 medium reasoning，中型 PR 使用 high，大型 PR 使用 xhigh；父 Agent
-不会读取 patch。
+快速和聚焦复审要求标准档（`standard`），中型 PR 要求进阶档（`advanced`），大型 PR
+要求最高能力档（`highest`）。Agent 从当前运行环境的可用模型中自主选择，并尊重用户
+指定的模型与约束；技能不固定模型名或推理强度。父 Agent 不会读取 patch。
+
+`organize-workspace` 是纯指导型技能，没有辅助脚本，也不依赖 Gitea。它尊重既有布局，
+保留仓库边界与历史证据，并区分归属建议、只读盘点、规划和已授权迁移。
+任务导航按规模分层，相关记录按需读取，避免将全部历史清单放入根 README。
+调用示例：“使用 $organize-workspace 只读盘点当前工作区并给出布局建议，不移动文件。”
 
 ## 性能评测
 
@@ -53,8 +60,9 @@
 ## 环境要求
 
 - 支持 [Agent Skills](https://agentskills.io/) 格式的 Agent 运行环境
-- Git 和 Python 3.11 或更高版本
-- 已为目标 Gitea 实例配置的 [Tea](https://gitea.com/gitea/tea)
+- Gitea 技能需要 Git、Python 3.11 或更高版本，以及已为目标实例配置的
+  [Tea](https://gitea.com/gitea/tea)
+- `organize-workspace` 盘点或迁移时需要文件系统访问，检查仓库时需要 Git；不依赖 Python 或 Tea
 - 使用 `skills` CLI 安装时需要 Node.js 和 npm
 
 凭据只保存在 Tea 的本地凭据存储中。Skill 不要求将 Token、密码或私钥提交到本仓库。
@@ -83,9 +91,12 @@ npx skills update --global --yes
 
 ## 沙盒权限
 
-三个 Skill 都需要通过网络访问 Gitea。在受管理的沙盒中，Agent 应在第一次执行脚本时
+三个 Gitea Skill 需要通过网络访问 Gitea。在受管理的沙盒中，Agent 应在第一次执行脚本时
 直接申请网络提权，不应先在受限沙盒中运行 Tea。脚本可以直接执行，因此长期授权可以
 限制到具体脚本，而不是放开通用 Python 解释器。
+
+`organize-workspace` 只需取得本次盘点或迁移所需的访问权限。请求布局建议不授权修改
+文件系统或操作服务。
 
 ## 开发
 
@@ -120,7 +131,8 @@ agent-skills/
 ├── skills/
 │   ├── gitea-merge/
 │   ├── gitea-release/
-│   └── gitea-review/
+│   ├── gitea-review/
+│   └── organize-workspace/
 ├── tests/
 ├── AGENTS.md
 ├── CONTRIBUTING.md

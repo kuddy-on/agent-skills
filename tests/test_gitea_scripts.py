@@ -1,4 +1,6 @@
+import argparse
 import importlib.util
+import io
 import json
 import subprocess
 import sys
@@ -6,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -232,9 +235,9 @@ class MergeTests(unittest.TestCase):
                 active -= 1
             if endpoint.endswith("/status"):
                 return {"state": "success"}
-            if endpoint.endswith("/reviews"):
+            if "/reviews?" in endpoint or endpoint.endswith("/reviews"):
                 return []
-            if endpoint.endswith("/commits"):
+            if "/commits?" in endpoint or endpoint.endswith("/commits"):
                 return [{"commit": {"message": "feat(api): test"}}]
             self.fail(f"unexpected endpoint: {endpoint}")
 
@@ -245,7 +248,7 @@ class MergeTests(unittest.TestCase):
                 "state": "open",
                 "mergeable": True,
                 "base": {"ref": "main"},
-                "head": {"sha": "head123"},
+                "head": {"ref": "feature/test", "sha": "head123"},
             }
         )
 
@@ -253,6 +256,198 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(
             merger.pr_commits(7)[0]["commit"]["message"], "feat(api): test"
         )
+
+    def test_comment_and_pending_reviews_do_not_clear_request_changes(self):
+        merger = self.make_merger()
+        merger.api = lambda endpoint: [
+            {
+                "id": 10,
+                "user": {"id": 1},
+                "state": "REQUEST_CHANGES",
+                "dismissed": False,
+            },
+            {"id": 11, "user": {"id": 1}, "state": "COMMENT", "dismissed": False},
+            {"id": 12, "user": {"id": 1}, "state": "PENDING", "dismissed": False},
+            {
+                "id": 20,
+                "user": {"id": 2},
+                "state": "REQUEST_CHANGES",
+                "dismissed": True,
+            },
+            {
+                "id": 30,
+                "user": {"id": 3},
+                "state": "REQUEST_CHANGES",
+                "dismissed": False,
+            },
+            {"id": 31, "user": {"id": 3}, "state": "APPROVED", "dismissed": False},
+        ]
+
+        states = merger.latest_review_states(7)
+
+        self.assertEqual(states, {1: "REQUEST_CHANGES", 3: "APPROVED"})
+
+    def test_reviews_and_commits_paginate_beyond_first_page(self):
+        merger = self.make_merger()
+
+        def api(endpoint):
+            if "/reviews?" in endpoint and "page=1" in endpoint:
+                return [
+                    {"id": idx, "user": {"id": idx}, "state": "APPROVED"}
+                    for idx in range(1, 51)
+                ]
+            if "/reviews?" in endpoint and "page=2" in endpoint:
+                return [{"id": 51, "user": {"id": 99}, "state": "REQUEST_CHANGES"}]
+            if "/commits?" in endpoint and "page=1" in endpoint:
+                return [{"commit": {"message": f"feat(c{i}): item"}} for i in range(50)]
+            if "/commits?" in endpoint and "page=2" in endpoint:
+                return [{"commit": {"message": "fixup! feat(c0): item"}}]
+            self.fail(f"unexpected endpoint: {endpoint}")
+
+        merger.api = api
+
+        self.assertEqual(merger.latest_review_states(7)[99], "REQUEST_CHANGES")
+        self.assertEqual(merger.select_merge_strategy(7)["selected"], "squash")
+
+    def test_validate_pr_rejects_release_please_draft_and_unconfirmed_mergeable(self):
+        cases = (
+            (
+                {
+                    "number": 7,
+                    "state": "open",
+                    "mergeable": True,
+                    "base": {"ref": "main"},
+                    "head": {
+                        "ref": "release-please--branches--main",
+                        "sha": "head123",
+                    },
+                },
+                "Release Please PR",
+            ),
+            (
+                {
+                    "number": 7,
+                    "state": "open",
+                    "draft": True,
+                    "mergeable": True,
+                    "base": {"ref": "main"},
+                    "head": {"ref": "feature/wip", "sha": "head123"},
+                },
+                "draft",
+            ),
+            (
+                {
+                    "number": 7,
+                    "state": "open",
+                    "mergeable": None,
+                    "base": {"ref": "main"},
+                    "head": {"ref": "feature/pending", "sha": "head123"},
+                },
+                "conflict status is not confirmed",
+            ),
+        )
+        for pr, pattern in cases:
+            with self.subTest(pattern=pattern):
+                merger = self.make_merger()
+                with self.assertRaisesRegex(merge.MergeError, pattern):
+                    merger.validate_pr(pr)
+
+    def test_protected_branch_skips_remote_and_local_cleanup(self):
+        merger = self.make_merger()
+        self.assertTrue(merger.is_protected_branch("develop"))
+        merger.cleanup("develop", "head123", remote_cleanup_requested=False)
+        self.assertEqual(
+            merger.summary["cleanup"]["remote"],
+            "skipped: feature branch is protected",
+        )
+
+    def test_cleanup_skips_branch_checked_out_in_another_worktree(self):
+        merger = self.make_merger()
+        commands = []
+
+        def command(args, check=True):
+            commands.append(args)
+            if args[:3] == ["git", "branch", "--show-current"]:
+                return completed(args, stdout="main\n")
+            if args[:3] == ["git", "worktree", "list"]:
+                return completed(
+                    args,
+                    stdout=(
+                        f"worktree {Path.cwd().resolve()}\n"
+                        "branch refs/heads/main\n\n"
+                        "worktree /tmp/other-worktree\n"
+                        "branch refs/heads/feature\n"
+                    ),
+                )
+            return completed(args)
+
+        merger.command = command
+        merger.cleanup("feature", "head123", True)
+
+        self.assertEqual(
+            merger.summary["cleanup"]["local"],
+            "skipped: feature branch is checked out in another worktree",
+        )
+        self.assertFalse(
+            any(cmd[:2] == ["git", "update-ref"] for cmd in commands),
+        )
+
+    def test_select_merge_strategy_handles_empty_commit_message(self):
+        merger = self.make_merger()
+        merger.pr_commits = lambda number: [
+            {"commit": {"message": ""}},
+            {"commit": {"message": "feat(api): valid"}},
+        ]
+        with self.assertRaises(merge.DecisionRequired):
+            merger.select_merge_strategy(7)
+
+    def test_squash_title_promotes_breaking_footer_and_skips_temporary_pr_title(self):
+        commits = [
+            {"commit": {"message": "fix: small tweak"}},
+            {
+                "commit": {
+                    "message": (
+                        "refactor(api): drop legacy endpoint\n\n"
+                        "BREAKING CHANGE: removed /v1/items"
+                    )
+                }
+            },
+        ]
+        title, source = merge.select_squash_title(commits, "fix: WIP temporary")
+        footers = merge.extract_breaking_change_footers(commits)
+
+        self.assertEqual(title, "refactor(api)!: drop legacy endpoint")
+        self.assertEqual(source, "pull request commits")
+        self.assertEqual(footers, "BREAKING CHANGE: removed /v1/items")
+
+    def test_resolve_repository_matches_case_insensitively_and_by_port(self):
+        merger = self.make_merger()
+        profiles = [
+            {"name": "wrong-port", "url": "https://gitea.example:3001"},
+            {"name": "right-port", "url": "https://gitea.example:3000"},
+        ]
+
+        def command(args, check=True):
+            if args[:4] == ["git", "remote", "get-url", "origin"]:
+                return completed(
+                    args, stdout="https://gitea.example:3000/myorg/myrepo.git\n"
+                )
+            if args[:4] == ["tea", "login", "list", "--output"]:
+                return completed(args, stdout=json.dumps(profiles))
+            if args[:4] == ["tea", "api", "--login", "right-port"]:
+                return completed(
+                    args,
+                    stdout=json.dumps(
+                        {"full_name": "MyOrg/MyRepo", "permissions": {"push": True}}
+                    ),
+                )
+            self.fail(f"unexpected command: {args}")
+
+        merger.command = command
+        merger.resolve_repository()
+
+        self.assertEqual(merger.login, "right-port")
+        self.assertEqual(merger.repo_slug, "MyOrg/MyRepo")
 
 
 class ReleaseTests(unittest.TestCase):
@@ -386,6 +581,8 @@ class ReleaseTests(unittest.TestCase):
                 }
             if "/status?limit=1" in endpoint:
                 return {"state": "pending", "total_count": 0, "statuses": None}
+            if "/pulls/8/reviews" in endpoint:
+                return []
             self.fail(f"unexpected API endpoint: {endpoint}")
 
         publisher.api = api
@@ -537,6 +734,241 @@ class ReleaseTests(unittest.TestCase):
 
         with self.assertRaisesRegex(release.ReleaseError, "no CI status results"):
             publisher.validate_release_force_merge_policy("head456")
+
+    def test_release_refuses_force_merge_when_other_gates_are_masked_by_missing_ci(
+        self,
+    ):
+        release_pr = {
+            "number": 8,
+            "title": "chore(main): release 1.2.3",
+            "state": "open",
+            "merged": False,
+            "mergeable": True,
+            "base": {"ref": "main"},
+            "head": {"ref": "release-please--branches--main", "sha": "head456"},
+        }
+        scenarios = (
+            (
+                "request_changes",
+                {
+                    "enable_status_check": True,
+                    "required_approvals": 1,
+                },
+                {
+                    "/pulls/8/reviews": [
+                        {
+                            "id": 1,
+                            "user": {"id": 2},
+                            "state": "REQUEST_CHANGES",
+                            "dismissed": False,
+                        }
+                    ]
+                },
+                "request-changes",
+            ),
+            (
+                "official_review_request",
+                {
+                    "enable_status_check": True,
+                    "required_approvals": 1,
+                    "block_on_official_review_requests": True,
+                },
+                {
+                    "/pulls/8/reviews": [
+                        {
+                            "id": 1,
+                            "user": {"id": 2},
+                            "state": "REQUEST_REVIEW",
+                            "dismissed": False,
+                        }
+                    ]
+                },
+                "official review requests",
+            ),
+            (
+                "outdated_branch",
+                {
+                    "enable_status_check": True,
+                    "required_approvals": 1,
+                    "block_on_outdated_branch": True,
+                },
+                {
+                    "/pulls/8/reviews": [],
+                    "/branches/main": {"commit": {"id": "base999"}},
+                    "/compare/head456...base999": {"total_commits": 1},
+                },
+                "behind main",
+            ),
+            (
+                "protected_files",
+                {
+                    "enable_status_check": True,
+                    "required_approvals": 1,
+                    "protected_file_patterns": ".gitea/**",
+                },
+                {
+                    "/pulls/8/reviews": [],
+                    "/pulls/8/files": [{"filename": ".gitea/workflows/release.yml"}],
+                },
+                "protected files",
+            ),
+            (
+                "unsigned_commits",
+                {
+                    "enable_status_check": True,
+                    "required_approvals": 1,
+                    "require_signed_commits": True,
+                },
+                {
+                    "/pulls/8/reviews": [],
+                    "/pulls/8/commits": [
+                        {"commit": {"verification": {"verified": False}}}
+                    ],
+                },
+                "unsigned or unverified commits",
+            ),
+        )
+        for name, protection, extra, pattern in scenarios:
+            with self.subTest(scenario=name):
+                publisher = self.make_publisher()
+
+                def api(endpoint, protection=protection, extra=extra):
+                    if "/branch_protections/" in endpoint:
+                        return protection
+                    if "/status?limit=1" in endpoint:
+                        return {"state": "pending", "total_count": 0, "statuses": None}
+                    for needle, payload in extra.items():
+                        if needle in endpoint:
+                            return payload
+                    self.fail(f"unexpected API endpoint: {endpoint}")
+
+                publisher.api = api
+                with self.assertRaisesRegex(release.ReleaseError, pattern):
+                    publisher.validate_release_force_merge_policy(
+                        "head456", pr=release_pr
+                    )
+
+    def test_release_matches_wildcard_branch_protection_rule(self):
+        publisher = self.make_publisher()
+
+        def api(endpoint):
+            if endpoint.endswith("/branch_protections/main"):
+                raise release.ReleaseError("not found")
+            if endpoint.endswith("/branch_protections"):
+                return [
+                    {
+                        "rule_name": "release/*",
+                        "enable_status_check": False,
+                        "required_approvals": 0,
+                        "priority": 1,
+                    },
+                    {
+                        "rule_name": "m*",
+                        "enable_status_check": True,
+                        "required_approvals": 1,
+                        "priority": 2,
+                    },
+                ]
+            if "/status?limit=1" in endpoint:
+                return {"state": "pending", "total_count": 0, "statuses": None}
+            if "/pulls/8/reviews" in endpoint:
+                return []
+            self.fail(f"unexpected API endpoint: {endpoint}")
+
+        publisher.api = api
+        publisher.validate_release_force_merge_policy(
+            "head456",
+            pr={"number": 8, "draft": False},
+        )
+
+    def test_release_title_accepts_component_and_v_prefix(self):
+        publisher = self.make_publisher()
+        for title in (
+            "chore(main): release 1.2.3",
+            "chore(main): release v1.2.3",
+            "chore(main): release agent-skills 1.2.3",
+        ):
+            with self.subTest(title=title):
+                version = publisher.validate_release_pr(
+                    {
+                        "number": 8,
+                        "state": "open",
+                        "merged": False,
+                        "mergeable": True,
+                        "title": title,
+                        "base": {"ref": "main"},
+                        "head": {"ref": "release-please--branches--main"},
+                    }
+                )
+                self.assertEqual(version, "1.2.3")
+
+    def test_verify_tag_uses_gitea_api_and_validates_commit_sha(self):
+        publisher = self.make_publisher()
+
+        def api(endpoint):
+            if endpoint.endswith("/tags/v1.2.3"):
+                return {"name": "v1.2.3", "commit": {"sha": "release123"}}
+            raise release.ReleaseError("not found")
+
+        publisher.api = api
+        self.assertEqual(
+            publisher.verify_tag("1.2.3", expected_commit="release123"), "v1.2.3"
+        )
+        with self.assertRaisesRegex(release.ReleaseError, "expected other999"):
+            publisher.verify_tag("1.2.3", expected_commit="other999")
+
+    def test_verify_tag_respects_explicit_tag_prefix_and_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / "release-please-config.json").write_text(
+                json.dumps({"packages": {".": {"include-v-in-tag": False}}}),
+                encoding="utf-8",
+            )
+            publisher = release.Publisher(
+                repo,
+                "main",
+                "release.yml",
+                "release-please--branches--main",
+                1,
+                10,
+                True,
+                None,
+            )
+            self.assertEqual(publisher.candidate_tags("1.2.3"), ["1.2.3", "v1.2.3"])
+
+            prefixed = release.Publisher(
+                repo,
+                "main",
+                "release.yml",
+                "release-please--branches--main",
+                1,
+                10,
+                True,
+                None,
+                tag_prefix="pkg-v",
+            )
+            self.assertEqual(prefixed.candidate_tags("1.2.3"), ["pkg-v1.2.3"])
+
+    def test_workflow_runs_url_encodes_branch_with_slash(self):
+        publisher = release.Publisher(
+            Path.cwd(),
+            "release/1.0",
+            "release.yml",
+            "release-please--branches--release/1.0",
+            1,
+            10,
+            True,
+            None,
+        )
+        endpoints = []
+
+        def api(endpoint):
+            endpoints.append(endpoint)
+            return {"workflow_runs": []}
+
+        publisher.api = api
+        publisher.workflow_runs()
+        self.assertIn("branch=release%2F1.0", endpoints[0])
 
 
 class ReviewTests(unittest.TestCase):
@@ -712,7 +1144,7 @@ class ReviewTests(unittest.TestCase):
         self.assertIn(own_review, bounded)
         self.assertEqual(profile["lane"], "focused-rereview")
 
-    def test_review_profile_routes_reasoning_effort_by_scale(self):
+    def test_review_profile_routes_capability_tiers_without_model_overrides(self):
         fast = review.choose_review_profile(
             {"files": 20, "changed_lines": 800, "high_risk_files": 2},
             None,
@@ -735,25 +1167,326 @@ class ReviewTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            (fast["lane"], fast["worker"]["reasoning_effort"]),
-            ("fast", "medium"),
+            (fast["lane"], fast["worker"]),
+            ("fast", {"capability_tier": "standard"}),
         )
         self.assertEqual(
-            (medium["lane"], medium["worker"]["reasoning_effort"]),
-            ("medium", "high"),
+            (medium["lane"], medium["worker"]),
+            ("medium", {"capability_tier": "advanced"}),
         )
         self.assertEqual(
-            (large["lane"], large["worker"]["reasoning_effort"]),
-            ("large", "xhigh"),
+            (large["lane"], large["worker"]),
+            ("large", {"capability_tier": "highest"}),
         )
         self.assertEqual(
-            (focused["lane"], focused["worker"]["reasoning_effort"]),
-            ("focused-rereview", "medium"),
+            (focused["lane"], focused["worker"]),
+            ("focused-rereview", {"capability_tier": "standard"}),
         )
+
+    def test_each_size_dimension_can_raise_the_capability_tier(self):
+        for field, value, tier in (
+            ("files", 21, "advanced"),
+            ("changed_lines", 801, "advanced"),
+            ("high_risk_files", 3, "advanced"),
+            ("files", 51, "highest"),
+            ("changed_lines", 3_001, "highest"),
+            ("high_risk_files", 11, "highest"),
+        ):
+            with self.subTest(field=field, value=value):
+                profile = review.choose_review_profile({field: value}, None, "head123")
+                self.assertEqual(profile["worker"]["capability_tier"], tier)
+
+    def test_split_diff_handles_spaces_octal_utf8_quotes_renames_and_crlf(self):
+        diff = (
+            "diff --git a/file name.py b/file name.py\n"
+            "--- a/file name.py\n"
+            "+++ b/file name.py\n"
+            "@@ -1 +1 @@\n+space\n"
+            'diff --git "a/dir/\\344\\270\\255\\346\\226\\207.md" '
+            '"b/dir/\\344\\270\\255\\346\\226\\207.md"\n'
+            '--- "a/dir/\\344\\270\\255\\346\\226\\207.md"\n'
+            '+++ "b/dir/\\344\\270\\255\\346\\226\\207.md"\n'
+            "@@ -1 +1 @@\n+cn\n"
+            "diff --git a/it's.py b/it's.py\n"
+            "--- a/it's.py\n"
+            "+++ b/it's.py\n"
+            "@@ -1 +1 @@\n+quote\n"
+            "diff --git a/normal.py b/normal.py\r\n"
+            "--- a/normal.py\r\n"
+            "+++ b/normal.py\r\n"
+            "@@ -1 +1 @@\r\n+crlf\r\n"
+            "diff --git a/empty name.txt b/empty name.txt\n"
+            "new file mode 100644\n"
+            "diff --git a/old name.py b/new name.py\n"
+            "rename from old name.py\n"
+            "rename to new name.py\n"
+        )
+        sections = review.split_diff(diff)
+
+        self.assertIn("file name.py", sections)
+        self.assertIn("dir/中文.md", sections)
+        self.assertIn("it's.py", sections)
+        self.assertIn("normal.py", sections)
+        self.assertIn("empty name.txt", sections)
+        self.assertIn("new name.py", sections)
+
+    def test_extract_issue_refs_filters_noise_and_fetch_issues_tolerates_404(self):
+        pull = review.PullRef("gitea.example", "owner", "repo", 1, "url")
+        body = (
+            "Color #000000 and URL https://example.com/a/b#1 and `#2`\n"
+            "```\n#3\n```\n"
+            "Fixes #42 and other/repo#7"
+        )
+        refs = review.extract_issue_refs(body, pull)
+        self.assertEqual(refs, [("other", "repo", 7), ("owner", "repo", 42)])
+
+        with patch.object(
+            review.TeaClient,
+            "api_json",
+            side_effect=FileNotFoundError("/repos/owner/repo/issues/42"),
+        ):
+            self.assertEqual(
+                review.fetch_issues("reviewer", [("owner", "repo", 42)], pull), []
+            )
+
+        with patch.object(
+            review.TeaClient,
+            "api_json",
+            side_effect=RuntimeError("network_access_required: blocked"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "network_access_required"):
+                review.fetch_issues("reviewer", [("owner", "repo", 42)], pull)
+
+    def test_classify_pull_scores_changes_identically_to_snapshot_and_returns_login(
+        self,
+    ):
+        pull = review.PullRef("gitea.example", "owner", "repo", 1, "url")
+
+        def api_json(self_client, endpoint):
+            if endpoint == "/user":
+                return {"login": "reviewer"}
+            if endpoint == "/repos/owner/repo/pulls/1":
+                return {
+                    "number": 1,
+                    "head": {"ref": "feat", "sha": "head123"},
+                    "base": {"ref": "main", "sha": "base123"},
+                }
+            if "/files?" in endpoint:
+                return [
+                    {"filename": "auth/a.py", "additions": 1, "deletions": 0},
+                    {"filename": "auth/b.py", "additions": 1, "deletions": 0},
+                    {
+                        "filename": "src/api/handler.py",
+                        "additions": 500,
+                        "deletions": 0,
+                    },
+                ]
+            if "/reviews?" in endpoint:
+                return []
+            raise AssertionError(f"unexpected endpoint: {endpoint}")
+
+        with patch.object(review.TeaClient, "api_json", api_json):
+            result = review.classify_pull(pull, "my-login")
+
+        self.assertEqual(result["login"], "my-login")
+        self.assertEqual(result["stats"]["high_risk_files"], 3)
+        self.assertEqual(result["review_profile"]["lane"], "medium")
         self.assertEqual(
-            {profile["worker"]["model"] for profile in (fast, medium, large, focused)},
-            {"gpt-5.6-sol"},
+            result["review_profile"]["worker"]["capability_tier"], "advanced"
         )
+
+    def test_snapshot_invalidates_cache_when_pr_base_changes(self):
+        pull = review.PullRef(
+            "gitea.example",
+            "owner",
+            "repo",
+            1,
+            "https://gitea.example/owner/repo/pulls/1",
+        )
+        state = {"base_ref": "main", "base_sha": "base1", "diff_calls": 0}
+
+        def api_json(self_client, endpoint):
+            if endpoint == "/user":
+                return {"login": "reviewer"}
+            if endpoint == "/repos/owner/repo/pulls/1":
+                return {
+                    "number": 1,
+                    "title": "PR",
+                    "body": "",
+                    "state": "open",
+                    "head": {"ref": "feat", "sha": "head123"},
+                    "base": {"ref": state["base_ref"], "sha": state["base_sha"]},
+                }
+            if "/commits?" in endpoint:
+                return [{"sha": "head123", "commit": {"message": "feat: x"}}]
+            if "/reviews?" in endpoint:
+                return []
+            if "/files?" in endpoint:
+                return [
+                    {
+                        "filename": f"{state['base_ref']}.py",
+                        "status": "modified",
+                        "additions": 1,
+                        "deletions": 0,
+                    }
+                ]
+            raise AssertionError(f"unexpected endpoint: {endpoint}")
+
+        def api_text(self_client, endpoint):
+            if endpoint.endswith(".diff"):
+                state["diff_calls"] += 1
+                name = f"{state['base_ref']}.py"
+                return (
+                    f"diff --git a/{name} b/{name}\n"
+                    f"--- a/{name}\n+++ b/{name}\n+ok\n"
+                )
+            return '{"message":"not found"}'
+
+        with tempfile.TemporaryDirectory() as directory:
+            cache_dir = Path(directory) / "head123"
+            with (
+                patch.object(review, "cache_dir_for", return_value=cache_dir),
+                patch.object(review.TeaClient, "api_json", api_json),
+                patch.object(review.TeaClient, "api_text", api_text),
+            ):
+                first = review.build_snapshot(pull, "my-login", refresh=False)
+                second = review.build_snapshot(pull, "my-login", refresh=False)
+                state["base_ref"] = "release"
+                state["base_sha"] = "base2"
+                retargeted = review.build_snapshot(pull, "my-login", refresh=False)
+
+        self.assertFalse(first["cache"]["reused_code_snapshot"])
+        self.assertTrue(second["cache"]["reused_code_snapshot"])
+        self.assertFalse(retargeted["cache"]["reused_code_snapshot"])
+        self.assertEqual(state["diff_calls"], 2)
+        self.assertEqual(retargeted["files"][0]["filename"], "release.py")
+        self.assertFalse(first["commands"]["submit"].startswith("python3 "))
+        self.assertIn("--login my-login", first["commands"]["submit"])
+        self.assertIn("--head head123", first["commands"]["show_files"])
+
+    def test_submit_review_uses_reviews_api_with_commit_id_and_no_retry(self):
+        commands = []
+        retries_used = []
+
+        def fake_run(self_client, *args):
+            commands.append(args)
+            retries_used.append(self_client.retries)
+            if args[:2] == ("api", "--login") and "--method" in args:
+                return '{"id": 22}'
+            endpoint = args[-1]
+            if endpoint == "/user":
+                return json.dumps({"login": "reviewer"})
+            if endpoint == "/repos/owner/repo/pulls/1":
+                return json.dumps({"head": {"ref": "feat", "sha": "head123"}})
+            if "/reviews?" in endpoint:
+                return json.dumps(
+                    [
+                        {
+                            "id": 21,
+                            "user": {"login": "other"},
+                            "state": "COMMENT",
+                            "commit_id": "head123",
+                            "body": "note",
+                        },
+                        {
+                            "id": 22,
+                            "user": {"login": "reviewer"},
+                            "state": "APPROVED",
+                            "commit_id": "head123",
+                            "body": "--help\nVerified line two",
+                        },
+                    ]
+                )
+            raise AssertionError(f"unexpected args: {args}")
+
+        ns = argparse.Namespace(
+            url="https://gitea.example/owner/repo/pulls/1",
+            login="rev-login",
+            expected_head="head123",
+            state="approve",
+            body="--help\nVerified line two",
+            body_file=None,
+            dry_run=False,
+        )
+        stdout = io.StringIO()
+        with (
+            patch.object(review.TeaClient, "run", fake_run),
+            redirect_stdout(stdout),
+        ):
+            review.submit_review(ns)
+
+        post_cmd = next(cmd for cmd in commands if "--method" in cmd)
+        post_index = commands.index(post_cmd)
+        self.assertEqual(retries_used[post_index], 0)
+        self.assertIn("event=APPROVED", post_cmd)
+        self.assertIn("commit_id=head123", post_cmd)
+        self.assertIn("body=--help\nVerified line two", post_cmd)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["latest_review"]["id"], 22)
+        self.assertTrue(payload["multiline_body"])
+
+    def test_show_cached_truncates_oversized_single_file_and_supports_head(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache_dir = Path(directory) / "head123"
+            cache_dir.mkdir(parents=True)
+            (cache_dir / "bundle.json").write_text(
+                json.dumps({"files": [{"filename": "big.py", "risk_score": 40}]}),
+                encoding="utf-8",
+            )
+            (cache_dir / "full.diff").write_text(
+                "diff --git a/big.py b/big.py\n--- a/big.py\n+++ b/big.py\n"
+                + "+x" * 200
+                + "\n",
+                encoding="utf-8",
+            )
+            ns = argparse.Namespace(
+                url="https://gitea.example/owner/repo/pulls/1",
+                head="head123",
+                files=["big.py"],
+                review_set=False,
+                risk="high",
+                instructions=False,
+                max_chars=120,
+            )
+            stdout = io.StringIO()
+            with (
+                patch.object(review, "cache_dir_for", return_value=cache_dir),
+                redirect_stdout(stdout),
+            ):
+                review.show_cached(ns)
+
+        output = stdout.getvalue()
+        self.assertTrue(output)
+        self.assertIn("truncated at 120 chars", output)
+
+    def test_parse_pull_url_supports_subpath_tabs_and_case_insensitive_login(self):
+        pull = review.parse_pull_url(
+            "https://gitea.example:3000/gitea/MyOrg/MyRepo/pulls/12/files"
+        )
+        self.assertEqual(pull.host, "gitea.example")
+        self.assertEqual(pull.port, 3000)
+        self.assertEqual(pull.slug, "MyOrg/MyRepo")
+        self.assertEqual(pull.index, 12)
+        self.assertEqual(
+            pull.url, "https://gitea.example:3000/gitea/MyOrg/MyRepo/pulls/12"
+        )
+
+        profiles = [
+            {"name": "p3001", "url": "https://gitea.example:3001"},
+            {"name": "p3000", "url": "https://gitea.example:3000/gitea"},
+        ]
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:3] == ["tea", "login", "list"]:
+                return completed(cmd, stdout=json.dumps(profiles))
+            if cmd[:4] == ["tea", "api", "--login", "p3000"]:
+                return completed(
+                    cmd, stdout=json.dumps({"full_name": "myorg/myrepo"})
+                )
+            raise AssertionError(f"unexpected cmd: {cmd}")
+
+        with patch.object(review.subprocess, "run", fake_run):
+            self.assertEqual(review.resolve_login(pull, None), "p3000")
 
 
 if __name__ == "__main__":
