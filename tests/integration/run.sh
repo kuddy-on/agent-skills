@@ -136,13 +136,21 @@ PR_NUMBER="$(api POST /repos/owner/sandbox/pulls \
   jq --raw-output '.number')"
 test "$PR_NUMBER" -gt 0
 
-HOME="$TEA_HOME" tea login add \
+TEA_ENV=(
+  env
+  "HOME=$TEA_HOME"
+  "XDG_CONFIG_HOME=$TEA_HOME/.config"
+  "XDG_CACHE_HOME=$TEA_HOME/.cache"
+  "XDG_DATA_HOME=$TEA_HOME/.local/share"
+)
+
+"${TEA_ENV[@]}" tea login add \
   --name integration \
   --url "$GITEA_URL" \
   --token "$TOKEN" \
   --no-version-check >/dev/null
 
-RESULT="$(HOME="$TEA_HOME" "$ROOT/skills/gitea-merge/scripts/merge.py" \
+RESULT="$("${TEA_ENV[@]}" "$ROOT/skills/gitea-merge/scripts/merge.py" \
   --repo "$REPO_DIR" \
   --pr "$PR_NUMBER")"
 printf '%s\n' "$RESULT" | jq --exit-status \

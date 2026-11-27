@@ -18,7 +18,11 @@ from urllib.parse import urlparse
 
 CONVENTIONAL_TITLE = re.compile(
     r"^(?P<type>feat|fix|perf|refactor|docs|test|build|ci|chore|style|revert)"
-    r"(?:\((?P<scope>[^)]+)\))?(?P<breaking>!)?:\s+\S.*"
+    r"(?:\((?P<scope>[^)]+)\))?(?P<breaking>!)?:\s+(?P<description>\S.*)"
+)
+BREAKING_CHANGE_FOOTER = re.compile(
+    r"^BREAKING[ -]CHANGE:\s*(?P<detail>\S.*)",
+    re.MULTILINE,
 )
 TEMPORARY_TITLE = re.compile(
     r"(?:^fixup!|^squash!|\bWIP\b|debug|临时|修复(?:测试|CI)|"
@@ -27,6 +31,10 @@ TEMPORARY_TITLE = re.compile(
 )
 ISSUE_REFERENCE = re.compile(r"(?<![\w/])#(\d+)\b")
 RELEASE_BRANCH_PREFIX = "release-please--branches--"
+PROTECTED_BRANCHES = frozenset({"main", "master", "dev", "develop"})
+DECISIVE_REVIEW_STATES = frozenset({"APPROVED", "REQUEST_CHANGES"})
+PAGE_SIZE = 50
+MAX_API_PAGES = 20
 NETWORK_ERRORS = (
     "connection refused",
     "connection reset",
@@ -69,6 +77,25 @@ def validate_squash_title(title: str | None) -> str:
     return candidate
 
 
+def promote_breaking_title(title: str, match: re.Match[str]) -> str:
+    if match.group("breaking"):
+        return title
+    scope = match.group("scope")
+    prefix = f"{match.group('type')}({scope})" if scope else match.group("type")
+    return f"{prefix}!: {match.group('description')}"
+
+
+def extract_breaking_change_footers(commits: list[dict[str, Any]]) -> str | None:
+    footers: list[str] = []
+    for commit in commits:
+        message = str(commit.get("commit", {}).get("message") or "")
+        for match in BREAKING_CHANGE_FOOTER.finditer(message):
+            line = f"BREAKING CHANGE: {match.group('detail').strip()}"
+            if line not in footers:
+                footers.append(line)
+    return "\n".join(footers) if footers else None
+
+
 def select_squash_title(
     commits: list[dict[str, Any]],
     pr_title: str | None = None,
@@ -78,10 +105,12 @@ def select_squash_title(
         return validate_squash_title(explicit_title), "explicit"
 
     if pr_title is not None:
-        try:
-            return validate_squash_title(pr_title), "pull request"
-        except MergeError:
-            pass
+        cleaned_pr_title = str(pr_title).strip()
+        if not TEMPORARY_TITLE.search(cleaned_pr_title):
+            try:
+                return validate_squash_title(cleaned_pr_title), "pull request"
+            except MergeError:
+                pass
 
     candidates: list[tuple[int, int, str]] = []
     for index, commit in enumerate(commits):
@@ -93,9 +122,11 @@ def select_squash_title(
         match = CONVENTIONAL_TITLE.fullmatch(title)
         if not match or TEMPORARY_TITLE.search(title):
             continue
+        has_breaking_footer = bool(BREAKING_CHANGE_FOOTER.search(message))
         commit_type = match.group("type")
-        if match.group("breaking"):
+        if match.group("breaking") or has_breaking_footer:
             rank = 0
+            title = promote_breaking_title(title, match)
         elif commit_type == "feat":
             rank = 1
         elif commit_type == "fix":
@@ -202,9 +233,31 @@ class Merger:
             raise MergeError(f"Gitea API error for {resolved}: {value['message']}")
         return value
 
+    def api_paginated(
+        self,
+        endpoint: str,
+        *,
+        page_size: int = PAGE_SIZE,
+        max_pages: int = MAX_API_PAGES,
+    ) -> list[Any]:
+        separator = "&" if "?" in endpoint else "?"
+        items: list[Any] = []
+        for page in range(1, max_pages + 1):
+            batch = self.api(f"{endpoint}{separator}page={page}&limit={page_size}")
+            if not isinstance(batch, list):
+                raise MergeError(
+                    f"Gitea API returned unexpected list data for {endpoint}"
+                )
+            items.extend(batch)
+            if len(batch) < page_size:
+                return items
+        raise MergeError(
+            f"Gitea API pagination exceeded {page_size * max_pages} items for {endpoint}"
+        )
+
     def resolve_repository(self) -> None:
         origin = self.command(["git", "remote", "get-url", "origin"]).stdout.strip()
-        host, owner, repo_name = parse_origin(origin)
+        host, http_port, owner, repo_name = parse_origin(origin)
         self.owner = owner
         self.repo_name = repo_name
         self.repo_slug = f"{owner}/{repo_name}"
@@ -228,7 +281,7 @@ class Merger:
                 raise MergeError(
                     f"Tea login {self.requested_login!r} is not configured"
                 )
-            if not login_matches_host(selected, host):
+            if not login_matches_host(selected, host, http_port):
                 raise MergeError(
                     f"Tea login {self.requested_login!r} does not match origin host {host}"
                 )
@@ -237,23 +290,27 @@ class Merger:
             candidates = [
                 str(profile.get("name"))
                 for profile in profiles
-                if profile.get("name") and login_matches_host(profile, host)
+                if profile.get("name") and login_matches_host(profile, host, http_port)
             ]
 
         accessible = []
         errors: dict[str, str] = {}
+        network_error: NetworkAccessRequired | None = None
         for login in candidates:
             try:
                 repository = self.api_for_login(endpoint, login)
-            except NetworkAccessRequired:
-                raise
+            except NetworkAccessRequired as exc:
+                network_error = network_error or exc
+                errors[login] = str(exc)
+                continue
             except MergeError as exc:
                 errors[login] = str(exc)
                 continue
             if not isinstance(repository, dict):
                 errors[login] = "Gitea returned unexpected repository data"
                 continue
-            if repository.get("full_name") != self.repo_slug:
+            full_name = str(repository.get("full_name") or "")
+            if full_name.casefold() != self.repo_slug.casefold():
                 errors[login] = str(repository.get("message") or "repository not found")
                 continue
             permissions = repository.get("permissions") or {}
@@ -270,14 +327,20 @@ class Merger:
                 f"multiple Tea logins can merge {self.repo_slug}: {names}; pass --login"
             )
         if not accessible:
+            if network_error is not None:
+                raise network_error
             detail = "; ".join(f"{name}: {error}" for name, error in errors.items())
             raise MergeError(
                 f"no Tea login with push access to {self.repo_slug}; pass --login. {detail}"
             )
 
         self.login, repository = accessible[0]
+        canonical_full_name = str(repository["full_name"])
+        if "/" in canonical_full_name:
+            self.owner, self.repo_name = canonical_full_name.split("/", 1)
+            self.repo_slug = canonical_full_name
         self.summary["login"] = self.login
-        self.summary["repository"] = repository["full_name"]
+        self.summary["repository"] = canonical_full_name
 
     def stage(self, name: str):
         merger = self
@@ -312,22 +375,35 @@ class Merger:
     def get_pr(self, number: int) -> dict[str, Any]:
         return self.api(f"/repos/{{owner}}/{{repo}}/pulls/{number}")
 
+    def is_protected_branch(self, branch: str | None) -> bool:
+        if not branch:
+            return True
+        return branch in (PROTECTED_BRANCHES | {self.base}) or branch.startswith(
+            RELEASE_BRANCH_PREFIX
+        )
+
     def latest_review_states(self, number: int) -> dict[int, str]:
-        reviews = self.api(f"/repos/{{owner}}/{{repo}}/pulls/{number}/reviews")
+        reviews = self.api_paginated(
+            f"/repos/{{owner}}/{{repo}}/pulls/{number}/reviews"
+        )
         latest: dict[int, tuple[int, str]] = {}
         for review in reviews:
+            if review.get("dismissed"):
+                continue
+            state = str(review.get("state") or "").upper()
+            if state not in DECISIVE_REVIEW_STATES:
+                continue
             user_id = (review.get("user") or {}).get("id")
             if user_id is None:
                 continue
             review_id = int(review.get("id") or 0)
-            state = str(review.get("state") or "").upper()
             if user_id not in latest or review_id > latest[user_id][0]:
                 latest[user_id] = (review_id, state)
         return {user_id: state for user_id, (_, state) in latest.items()}
 
     def pr_commits(self, number: int) -> list[dict[str, Any]]:
         if number not in self._commit_cache:
-            self._commit_cache[number] = self.api(
+            self._commit_cache[number] = self.api_paginated(
                 f"/repos/{{owner}}/{{repo}}/pulls/{number}/commits"
             )
         return self._commit_cache[number]
@@ -342,10 +418,10 @@ class Merger:
             }
 
         commits = self.pr_commits(number)
-        titles = [
-            str(commit.get("commit", {}).get("message") or "").splitlines()[0].strip()
-            for commit in commits
-        ]
+        titles: list[str] = []
+        for commit in commits:
+            lines = str(commit.get("commit", {}).get("message") or "").splitlines()
+            titles.append(lines[0].strip() if lines else "")
         evidence: dict[str, Any] = {
             "requested": "auto",
             "commit_count": len(titles),
@@ -411,15 +487,25 @@ class Merger:
 
     def validate_pr(self, pr: dict[str, Any]) -> None:
         number = int(pr["number"])
+        feature_branch = str((pr.get("head") or {}).get("ref") or "")
+        if feature_branch.startswith(RELEASE_BRANCH_PREFIX):
+            raise MergeError(
+                f"PR #{number} is a Release Please PR; use gitea-release instead"
+            )
         if (pr.get("base") or {}).get("ref") != self.base:
             raise MergeError(f"PR #{number} does not target {self.base}")
         if pr.get("merged"):
             return
         if pr.get("state") != "open":
             raise MergeError(f"PR #{number} is not open")
+        if pr.get("draft"):
+            raise MergeError(f"PR #{number} is a draft")
         if pr.get("mergeable") is False:
             raise MergeError(f"PR #{number} has conflicts")
+        if pr.get("mergeable") is not True:
+            raise MergeError(f"PR #{number} conflict status is not confirmed")
         head_sha = (pr.get("head") or {}).get("sha")
+        prefetch_commits = self.requested_merge_strategy in {"auto", "squash"}
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
             status_future = (
                 pool.submit(
@@ -432,10 +518,10 @@ class Merger:
             reviews_future = pool.submit(self.latest_review_states, number)
             commits_future = (
                 pool.submit(
-                    self.api,
+                    self.api_paginated,
                     f"/repos/{{owner}}/{{repo}}/pulls/{number}/commits",
                 )
-                if self.requested_merge_strategy == "auto"
+                if prefetch_commits
                 else None
             )
             status = status_future.result() if status_future else None
@@ -462,6 +548,7 @@ class Merger:
         expected_head: str,
         delete_branch: bool,
         squash_title: str | None = None,
+        squash_message: str | None = None,
     ) -> dict[str, Any]:
         endpoint = f"/repos/{self.repo_slug}/pulls/{number}/merge"
         command = [
@@ -485,6 +572,13 @@ class Merger:
                     f"merge_title_field={validate_squash_title(squash_title)}",
                 ]
             )
+            if squash_message:
+                command.extend(
+                    [
+                        "--field",
+                        f"merge_message_field={squash_message}",
+                    ]
+                )
         command.append(endpoint)
         try:
             result = self.command(command, check=False)
@@ -509,10 +603,21 @@ class Merger:
         )
         raise MergeError(f"PR #{number} merge failed: {detail}")
 
-    def base_head(self) -> str:
-        branch = self.api(f"/repos/{{owner}}/{{repo}}/branches/{self.base}")
-        commit = branch.get("commit") or {}
-        return commit.get("id") or commit.get("sha") or ""
+    def branches_in_other_worktrees(self) -> set[str]:
+        result = self.command(["git", "worktree", "list", "--porcelain"], check=False)
+        if result.returncode != 0 or not result.stdout.strip():
+            return set()
+        branches: set[str] = set()
+        current_path: Path | None = None
+        for line in result.stdout.splitlines():
+            if line.startswith("worktree "):
+                current_path = Path(line.split(" ", 1)[1].strip()).resolve()
+            elif line.startswith("branch ") and current_path is not None:
+                if current_path != self.repo:
+                    branches.add(line.split(" ", 1)[1].strip())
+            elif not line.strip():
+                current_path = None
+        return branches
 
     def cleanup(
         self,
@@ -520,21 +625,23 @@ class Merger:
         expected_head: str | None,
         remote_cleanup_requested: bool,
     ) -> None:
+        if feature_branch and feature_branch.startswith(RELEASE_BRANCH_PREFIX):
+            raise MergeError("refusing to clean a Release Please branch")
+        protected = self.is_protected_branch(feature_branch)
+        if protected:
+            remote_status = "skipped: feature branch is protected"
+        elif remote_cleanup_requested:
+            remote_status = "requested atomically with merge"
+        else:
+            remote_status = "skipped: PR was already merged"
         outcome: dict[str, Any] = {
             "requested": True,
             "local": "not-needed",
-            "remote": (
-                "requested atomically with merge"
-                if remote_cleanup_requested
-                else "skipped: PR was already merged"
-            ),
+            "remote": remote_status,
         }
-        protected = {self.base, "main", "master", "dev", "develop"}
-        if not feature_branch or feature_branch in protected or not expected_head:
+        if protected or not feature_branch or not expected_head:
             self.summary["cleanup"] = outcome
             return
-        if feature_branch.startswith(RELEASE_BRANCH_PREFIX):
-            raise MergeError("refusing to clean a Release Please branch")
 
         current = self.command(["git", "branch", "--show-current"]).stdout.strip()
         if current == feature_branch:
@@ -550,6 +657,12 @@ class Merger:
                 return
 
         ref = f"refs/heads/{feature_branch}"
+        if ref in self.branches_in_other_worktrees():
+            outcome["local"] = (
+                "skipped: feature branch is checked out in another worktree"
+            )
+            self.summary["cleanup"] = outcome
+            return
         local_exists = (
             self.command(
                 ["git", "show-ref", "--verify", "--quiet", ref],
@@ -582,26 +695,43 @@ def is_network_error(detail: str) -> bool:
     return any(marker in lowered for marker in NETWORK_ERRORS)
 
 
-def parse_origin(value: str) -> tuple[str, str, str]:
+def effective_http_port(parsed) -> int | None:
+    if parsed.scheme not in {"http", "https"}:
+        return None
+    if parsed.port is not None:
+        return parsed.port
+    return 443 if parsed.scheme == "https" else 80
+
+
+def parse_origin(value: str) -> tuple[str, int | None, str, str]:
     if "://" in value:
         parsed = urlparse(value)
         host = parsed.hostname
+        http_port = effective_http_port(parsed)
         path = parsed.path
     else:
         match = re.fullmatch(r"(?:[^@]+@)?([^:]+):(.+)", value)
         if not match:
             raise MergeError(f"unsupported origin URL: {value}")
         host, path = match.groups()
+        http_port = None
     parts = [part for part in path.strip("/").removesuffix(".git").split("/") if part]
     if not host or len(parts) != 2:
         raise MergeError(f"origin must identify one Gitea owner/repository: {value}")
-    return host.lower(), parts[0], parts[1]
+    return host.lower(), http_port, parts[0], parts[1]
 
 
-def login_matches_host(profile: dict[str, Any], host: str) -> bool:
-    url_host = urlparse(str(profile.get("url") or "")).hostname
+def login_matches_host(
+    profile: dict[str, Any], host: str, http_port: int | None = None
+) -> bool:
+    parsed = urlparse(str(profile.get("url") or ""))
+    url_host = (parsed.hostname or "").lower()
     ssh_host = str(profile.get("ssh_host") or "").lower()
-    return host == (url_host or "").lower() or host == ssh_host
+    if http_port is not None:
+        if host == url_host and effective_http_port(parsed) == http_port:
+            return True
+        return not url_host and host == ssh_host
+    return host == url_host or host == ssh_host
 
 
 def validate_repo_root(repo: Path) -> None:
@@ -694,15 +824,18 @@ def main() -> int:
             )
             summary["merge_strategy"] = strategy
             squash_title = None
+            squash_message = None
             if strategy and strategy["selected"] == "squash":
+                commits = merger.pr_commits(args.pr)
                 squash_title, squash_title_source = select_squash_title(
-                    merger.pr_commits(args.pr),
+                    commits,
                     pr.get("title"),
                     args.squash_title,
                 )
+                squash_message = extract_breaking_change_footers(commits)
                 strategy["squash_title"] = squash_title
                 strategy["squash_title_source"] = squash_title_source
-            elif args.squash_title is not None:
+            elif args.squash_title is not None and not pr.get("merged"):
                 raise MergeError("--squash-title requires the squash merge strategy")
 
         if args.dry_run:
@@ -712,6 +845,9 @@ def main() -> int:
             print(json.dumps(summary, ensure_ascii=False, indent=2))
             return 0
 
+        delete_remote_branch = args.cleanup and not merger.is_protected_branch(
+            feature_branch
+        )
         if pr.get("merged"):
             merger.log(f"PR #{args.pr} is already merged")
             merged = pr
@@ -721,8 +857,9 @@ def main() -> int:
                     args.pr,
                     strategy["selected"],
                     feature_head,
-                    args.cleanup,
+                    delete_remote_branch,
                     squash_title,
+                    squash_message,
                 )
 
         summary["merge_commit_sha"] = require_merge_commit_sha(merged, args.pr)
@@ -731,7 +868,9 @@ def main() -> int:
                 merger.cleanup(
                     feature_branch,
                     feature_head,
-                    remote_cleanup_requested=not bool(pr.get("merged")),
+                    remote_cleanup_requested=(
+                        delete_remote_branch and not bool(pr.get("merged"))
+                    ),
                 )
         else:
             summary["cleanup"] = {"requested": False}

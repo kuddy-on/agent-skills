@@ -17,7 +17,7 @@ if [[ -z "$ACTION" || -z "$STATE_DIR" ]]; then
   exit 2
 fi
 
-STATE_DIR="$(realpath -m "$STATE_DIR")"
+STATE_DIR="$(python3 -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$STATE_DIR")"
 FIXTURE="$STATE_DIR/fixture.json"
 
 stop_fixture() {
@@ -103,7 +103,7 @@ cleanup_on_error() {
 }
 trap cleanup_on_error EXIT INT TERM
 
-for command in curl docker git jq python3 tea realpath sha256sum; do
+for command in curl docker git jq python3 tea; do
   command -v "$command" >/dev/null || {
     printf 'required command not found: %s\n' "$command" >&2
     exit 1
@@ -225,10 +225,16 @@ pr="$(api POST "/repos/owner/$repo_name/pulls" \
   jq -r '.number')"
 login_token="$TOKEN"
 [[ "$CASE_NAME" == review ]] && login_token="$REVIEWER_TOKEN"
-HOME="$tea_home" tea login add --name benchmark --url "$HOST_GITEA_URL" \
+env \
+  "HOME=$tea_home" \
+  "XDG_CONFIG_HOME=$tea_home/.config" \
+  "XDG_CACHE_HOME=$tea_home/.cache" \
+  "XDG_DATA_HOME=$tea_home/.local/share" \
+  tea login add --name benchmark --url "$HOST_GITEA_URL" \
   --token "$login_token" --no-version-check >/dev/null
 tea_config="$tea_home/.config/tea/config.yml"
-sed -i "s#$HOST_GITEA_URL#$AGENT_GITEA_URL#g" "$tea_config"
+python3 -c 'import pathlib, sys; p = pathlib.Path(sys.argv[1]); p.write_text(p.read_text(encoding="utf-8").replace(sys.argv[2], sys.argv[3]), encoding="utf-8")' \
+  "$tea_config" "$HOST_GITEA_URL" "$AGENT_GITEA_URL"
 
 tree_sha="$(git -C "$repo_dir" rev-parse 'HEAD^{tree}')"
 fixture_input="$(jq -n \

@@ -15,6 +15,7 @@ body:
         - gitea-review
         - gitea-merge
         - gitea-release
+        - organize-workspace
         - Repository tooling or documentation
     validations:
       required: true
@@ -42,7 +43,7 @@ body:
     id: environment
     attributes:
       label: Environment
-      description: Agent runtime, OS, Python version, Tea version, and Gitea version.
+      description: Agent runtime and OS; Python, Tea, and Gitea versions when applicable.
     validations:
       required: true
   - type: textarea

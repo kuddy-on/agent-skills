@@ -24,7 +24,7 @@ Target a known Release Please PR when necessary:
 ```
 
 - Add `--dry-run` to validate the selected release without merging it.
-- Use `--base`, `--workflow`, or `--release-head-prefix` only when repository conventions differ from the defaults.
+- Use `--base`, `--workflow`, `--release-head-prefix`, or `--tag-prefix` only when repository conventions differ from the defaults.
 - Adjust polling and timeout only for known slow Gitea environments.
 - Pass `--login <profile>` when the user selects a Tea profile. Otherwise the script selects the only configured profile for `origin` that has push access; it stops when the choice is ambiguous.
 - Do not run `--dry-run` before an authorized publication unless the user explicitly requests a preview.
@@ -36,10 +36,10 @@ This Skill has no dependency on `gitea-merge` and does not inspect ordinary feat
 1. Validate the worktree, `tea`, Git remote, repository, and release workflow.
 2. Select one explicitly targeted Release Please PR, or require exactly one matching open PR.
 3. Validate its branch, title, semantic version, state, and mergeability.
-4. Rebase-merge the Release Please PR. Attempt one administrator force merge only when the target branch protection simultaneously enables CI status checks and requires at least one approval, the Release PR head has no CI status results at all, Gitea returns HTTP 405 because required statuses are missing, the unchanged PR remains conflict-free, and the selected Tea login has repository administrator permission.
+4. Rebase-merge the Release Please PR. Attempt one administrator force merge only when the target branch protection simultaneously enables CI status checks and requires at least one approval, the Release PR head has no CI status results at all, Gitea returns HTTP 405 because required statuses are missing, the unchanged PR remains conflict-free and non-draft with no outstanding request-changes reviews, pending official review requests, outdated base branch, protected-file violations, or unverified required signatures, and the selected Tea login has repository administrator permission.
 5. Wait for the matching release workflow at the resulting base-branch SHA.
 6. Require the workflow and every non-skipped job to succeed.
-7. Verify the version Tag on `origin` and verify the Gitea Release when the API supports it.
+7. Verify via Gitea API that the version Tag exists and points to the merged release commit, then verify the matching Gitea Release when the API supports it.
 8. Return a JSON summary with stage durations and URLs.
 
 Do not run application tests during publication; the ordinary PR merge gate is separate. Do not clean feature branches. Treat a Gitea Release API error as a warning only after workflow and remote Tag success.

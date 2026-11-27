@@ -80,8 +80,11 @@ class SkillLayoutTests(unittest.TestCase):
     def test_agent_interface_has_required_fields(self) -> None:
         required = {"display_name", "short_description", "default_prompt"}
         for skill_dir in self.skill_dirs:
+            agents_dir = skill_dir / "agents"
+            if not agents_dir.exists():
+                continue
             with self.subTest(skill=skill_dir.name):
-                interface = read_interface(skill_dir / "agents" / "openai.yaml")
+                interface = read_interface(agents_dir / "openai.yaml")
                 self.assertTrue(required.issubset(interface))
                 for key in required:
                     self.assertTrue(interface[key].strip(), f"{key} must not be empty")
@@ -99,7 +102,15 @@ class SkillLayoutTests(unittest.TestCase):
                     self.assertTrue(script.stat().st_mode & stat.S_IXUSR)
 
     def test_shell_scripts_use_bash_strict_mode(self) -> None:
-        for script in sorted(ROOT.glob("skills/*/scripts/*.sh")):
+        shell_scripts = sorted(
+            path
+            for root in (ROOT / "scripts", SKILLS_ROOT, ROOT / "tests")
+            if root.exists()
+            for path in root.rglob("*.sh")
+            if path.is_file()
+        )
+        self.assertTrue(shell_scripts, "expected repository shell scripts")
+        for script in shell_scripts:
             with self.subTest(script=script.relative_to(ROOT)):
                 lines = script.read_text(encoding="utf-8").splitlines()
                 self.assertEqual(lines[0], "#!/usr/bin/env bash")

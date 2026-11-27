@@ -3,8 +3,8 @@
 [![Test](https://github.com/kuddy-on/agent-skills/actions/workflows/test.yml/badge.svg)](https://github.com/kuddy-on/agent-skills/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Reusable Agent Skills for reviewing, merging, and releasing repositories hosted
-on Gitea.
+Reusable Agent Skills for organizing workspaces and reviewing, merging, and
+releasing repositories hosted on Gitea.
 
 [简体中文](README.zh-CN.md)
 
@@ -15,6 +15,7 @@ on Gitea.
 | `gitea-review` | Review or re-review a Gitea pull request and submit a formal review. |
 | `gitea-merge` | Merge an ordinary pull request with gated rebase, squash, or merge commit; squash titles are Release Please-compatible, and merged feature branches are deleted by default. |
 | `gitea-release` | Merge a Release Please pull request and verify its workflow, tag, and Gitea Release. |
+| `organize-workspace` | Plan or inventory multi-project and operations workspaces, decide file ownership, and carry out authorized reorganization. |
 
 Each skill can be installed and used independently. `gitea-release` does not
 depend on `gitea-merge` and only operates on an existing Release Please pull
@@ -22,8 +23,18 @@ request.
 
 `gitea-review` classifies PR size from metadata, then delegates the review to
 one reusable worker with no inherited conversation. Fast and focused reviews
-use medium reasoning, medium reviews use high, and large reviews use xhigh;
-the parent does not inspect the patch.
+request `standard` capability, medium reviews `advanced`, and large reviews
+`highest`. The agent selects a suitable model from the current runtime,
+respecting user choices and constraints; no model name or reasoning setting is
+pinned by the skill. The parent does not inspect the patch.
+
+`organize-workspace` provides guidance without helper scripts or a Gitea
+dependency. It respects existing layouts, preserves repository boundaries and
+historical evidence, and distinguishes advice, read-only inventory, planning,
+and authorized moves. Task navigation stays compact through grouped indexes
+and on-demand reading of relevant records. Example request: "Use
+$organize-workspace to inventory this workspace and propose a layout without
+moving any files."
 
 ## Performance benchmark
 
@@ -60,8 +71,10 @@ in parent JSONL, so its starred call count covers top-level events only. See
 
 - An agent runtime that supports the [Agent Skills](https://agentskills.io/)
   format
-- Git and Python 3.11 or newer
-- [Tea](https://gitea.com/gitea/tea) configured for the target Gitea instance
+- For Gitea skills: Git, Python 3.11 or newer, and
+  [Tea](https://gitea.com/gitea/tea) configured for the target Gitea instance
+- For `organize-workspace`: filesystem access for inventory or moves, and Git
+  when inspecting repositories; no Python or Tea dependency
 - Node.js and npm when installing with the `skills` CLI
 
 Credentials remain in Tea's local credential store. The skills never require
@@ -92,11 +105,15 @@ command again when a skill is newly added or renamed.
 
 ## Sandbox permissions
 
-All three skills access Gitea over the network. In a managed sandbox, the agent
-must request network escalation on the first script invocation instead of first
+The three Gitea skills access Gitea over the network. In a managed sandbox, the
+agent must request network escalation on the first script invocation instead of first
 running Tea in the restricted sandbox. The scripts are directly executable so
 an approval can be scoped to the individual script rather than to a general
 Python interpreter.
+
+`organize-workspace` needs only the access required by the requested inventory
+or moves. A layout proposal does not authorize filesystem changes or service
+operations.
 
 ## Development
 
@@ -133,7 +150,8 @@ agent-skills/
 ├── skills/
 │   ├── gitea-merge/
 │   ├── gitea-release/
-│   └── gitea-review/
+│   ├── gitea-review/
+│   └── organize-workspace/
 ├── tests/
 ├── AGENTS.md
 ├── CONTRIBUTING.md

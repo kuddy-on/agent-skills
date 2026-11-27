@@ -1,4 +1,6 @@
 import importlib.util
+import os
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -13,6 +15,27 @@ SPEC.loader.exec_module(VERIFY)
 
 
 class BenchmarkVerificationTests(unittest.TestCase):
+    def test_benchmark_requires_runtime_model_before_setup(self) -> None:
+        env = {
+            key: value for key, value in os.environ.items() if key != "BENCHMARK_MODEL"
+        }
+        for script in ("run.sh", "run-review-ab.sh"):
+            with self.subTest(script=script):
+                result = subprocess.run(
+                    [
+                        "bash",
+                        str(ROOT / "tests/benchmark" / script),
+                        "unused-auth-fixture.json",
+                    ],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("BENCHMARK_MODEL", result.stderr)
+
     def setUp(self) -> None:
         self.entry = {"lane": "with-skill", "pr": 1}
         self.state = {
