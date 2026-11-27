@@ -38,34 +38,38 @@ moving any files."
 
 ## Performance benchmark
 
-On 2026-08-12, the isolated Docker benchmark ran three matched Skill/baseline
-pairs for each workflow with `gpt-5.6-sol`, medium reasoning, and image
-`agent-skills-codex-benchmark:0.147.0`. Every lane received a fresh Codex
-tmpfs, Gitea instance, repository, and identical PR metadata and commit SHAs.
-All 18 runs and server-state checks passed.
+On 2026-11-27 (commit `5dddb20`), the isolated Docker benchmark ran three
+matched Skill/baseline pairs for each Gitea workflow with `gpt-6.2-sol`, medium
+reasoning, and image `agent-skills-codex-benchmark:0.172.0`. The model and
+reasoning setting were chosen for this controlled run only and are not pinned
+defaults. `organize-workspace` is guidance-only and is not part of this
+automated Gitea benchmark. Every lane received a fresh Codex tmpfs, Gitea
+instance, repository, and identical PR metadata and commit SHAs. All 18 runs
+and server-state checks passed.
 
 | Skill | Verified pairs | Mean time, Skill / baseline | Time | Input tokens | Output tokens | Median top-level calls |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `gitea-merge` | 3/3 | 38.5s / 51.2s | -24.8% | -43.6% | -26.4% | 2 / 4 |
-| `gitea-review` | 3/3 | 60.4s / 72.4s | -16.6% | -48.1% | -66.5% | 3* / 9 |
-| `gitea-release` | 3/3 | 44.7s / 76.9s | -41.8% | -60.7% | -51.1% | 3 / 7 |
+| `gitea-merge` | 3/3 | 18.1s / 32.2s | -43.6% | -45.5% | -66.4% | 2 / 5 |
+| `gitea-review` | 3/3 | 40.5s / 45.4s | -10.7% | -35.6% | -60.7% | 3* / 9 |
+| `gitea-release` | 3/3 | 20.2s / 43.3s | -53.3% | -36.0% | -76.3% | 3 / 9 |
 
 Per-round wall time is shown as Skill / baseline; negative percentages favor
 the Skill:
 
 | Skill | Round 1 | Round 2 | Round 3 |
 | --- | ---: | ---: | ---: |
-| `gitea-merge` | 44.7s / 61.8s (-27.7%) | 43.7s / 44.3s (-1.4%) | 27.2s / 47.6s (-42.8%) |
-| `gitea-review` | 55.1s / 104.4s (-47.2%) | 54.7s / 63.0s (-13.0%) | 71.3s / 49.8s (+43.1%) |
-| `gitea-release` | 40.3s / 79.1s (-49.1%) | 47.7s / 72.7s (-34.4%) | 46.2s / 78.8s (-41.3%) |
+| `gitea-merge` | 19.2s / 31.9s (-39.9%) | 17.6s / 33.8s (-48.1%) | 17.7s / 30.8s (-42.7%) |
+| `gitea-review` | 41.9s / 41.9s (+0.0%) | 40.4s / 57.1s (-29.2%) | 39.1s / 37.0s (+5.5%) |
+| `gitea-release` | 20.3s / 40.9s (-50.4%) | 19.6s / 50.9s (-61.4%) | 20.8s / 38.2s (-45.6%) |
 
 Only `auth.json` was mounted from the host; the Skill lane additionally
 received its target Skill read-only. Local memory and caches were therefore
 isolated, but server-side prompt caching cannot be disabled: reported cached
 input tokens were nonzero and are included in the token comparisons above. The
 runner randomizes lane order. `gitea-review` worker internals are not emitted
-in parent JSONL, so its starred call count covers top-level events only. See
-[the benchmark guide](tests/benchmark/README.md) for reproduction details.
+in parent JSONL, so its starred call count and token totals cover top-level
+events only. See [the benchmark guide](tests/benchmark/README.md) for
+reproduction details.
 
 ## Requirements
 

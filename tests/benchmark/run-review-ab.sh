@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 FIXTURE_SCRIPT="$ROOT/tests/benchmark/fixture.sh"
-IMAGE="${BENCHMARK_IMAGE:-agent-skills-codex-benchmark:0.147.0}"
+IMAGE="${BENCHMARK_IMAGE:-agent-skills-codex-benchmark:0.172.0}"
 MODEL="${BENCHMARK_MODEL:-}"
 REASONING_EFFORT="${BENCHMARK_REASONING_EFFORT:-}"
 REPETITIONS="${BENCHMARK_REPETITIONS:-1}"
