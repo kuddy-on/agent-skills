@@ -599,8 +599,7 @@ class Publisher:
                     "could not verify base branch head for outdated-branch check"
                 )
             comparison = self.api(
-                f"/repos/{{owner}}/{{repo}}/compare/"
-                f"{head}...{quote(base_sha, safe='')}"
+                f"/repos/{{owner}}/{{repo}}/compare/{head}...{quote(base_sha, safe='')}"
             )
             if not isinstance(comparison, dict) or "total_commits" not in comparison:
                 raise ReleaseError(
@@ -852,9 +851,7 @@ class Publisher:
             return [version, f"v{version}"]
         return [f"v{version}", version]
 
-    def verify_tag(
-        self, version: str, expected_commit: str | None = None
-    ) -> str:
+    def verify_tag(self, version: str, expected_commit: str | None = None) -> str:
         candidates = self.candidate_tags(version)
         last_error = ""
         for tag_name in candidates:
@@ -891,9 +888,7 @@ class Publisher:
         try:
             release = self.api(f"/repos/{{owner}}/{{repo}}/releases/tags/{encoded}")
             if release.get("tag_name") != tag_name:
-                raise ReleaseError(
-                    f"Release API returned the wrong tag for {tag_name}"
-                )
+                raise ReleaseError(f"Release API returned the wrong tag for {tag_name}")
         except NetworkAccessRequired:
             raise
         except ReleaseError as exc:

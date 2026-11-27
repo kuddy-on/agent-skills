@@ -162,8 +162,7 @@ def resolve_login(pull: PullRef, requested: str | None) -> str:
         candidates = [
             str(profile.get("name"))
             for profile in profiles
-            if profile.get("name")
-            and login_matches_host(profile, pull.host, pull.port)
+            if profile.get("name") and login_matches_host(profile, pull.host, pull.port)
         ]
 
     accessible = []
@@ -289,9 +288,7 @@ class TeaClient:
         separator = "&" if "?" in endpoint else "?"
         items: list[Any] = []
         for page in range(1, max_pages + 1):
-            batch = self.api_json(
-                f"{endpoint}{separator}page={page}&limit={page_size}"
-            )
+            batch = self.api_json(f"{endpoint}{separator}page={page}&limit={page_size}")
             if not isinstance(batch, list):
                 raise RuntimeError(f"Gitea 返回的列表格式异常: {endpoint}")
             items.extend(batch)

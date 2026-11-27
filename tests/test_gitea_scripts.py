@@ -1337,8 +1337,7 @@ class ReviewTests(unittest.TestCase):
                 state["diff_calls"] += 1
                 name = f"{state['base_ref']}.py"
                 return (
-                    f"diff --git a/{name} b/{name}\n"
-                    f"--- a/{name}\n+++ b/{name}\n+ok\n"
+                    f"diff --git a/{name} b/{name}\n--- a/{name}\n+++ b/{name}\n+ok\n"
                 )
             return '{"message":"not found"}'
 
@@ -1480,9 +1479,7 @@ class ReviewTests(unittest.TestCase):
             if cmd[:3] == ["tea", "login", "list"]:
                 return completed(cmd, stdout=json.dumps(profiles))
             if cmd[:4] == ["tea", "api", "--login", "p3000"]:
-                return completed(
-                    cmd, stdout=json.dumps({"full_name": "myorg/myrepo"})
-                )
+                return completed(cmd, stdout=json.dumps({"full_name": "myorg/myrepo"}))
             raise AssertionError(f"unexpected cmd: {cmd}")
 
         with patch.object(review.subprocess, "run", fake_run):

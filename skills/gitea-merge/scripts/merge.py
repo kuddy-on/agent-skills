@@ -378,9 +378,8 @@ class Merger:
     def is_protected_branch(self, branch: str | None) -> bool:
         if not branch:
             return True
-        return (
-            branch in (PROTECTED_BRANCHES | {self.base})
-            or branch.startswith(RELEASE_BRANCH_PREFIX)
+        return branch in (PROTECTED_BRANCHES | {self.base}) or branch.startswith(
+            RELEASE_BRANCH_PREFIX
         )
 
     def latest_review_states(self, number: int) -> dict[int, str]:
