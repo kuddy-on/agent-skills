@@ -13,7 +13,7 @@ writable:
 docker build \
   --build-arg BENCH_UID="$(id -u)" \
   --build-arg BENCH_GID="$(id -g)" \
-  --tag agent-skills-codex-benchmark:0.147.0 \
+  --tag agent-skills-codex-benchmark:0.172.0 \
   tests/benchmark
 ```
 
@@ -29,13 +29,14 @@ docker run --rm --network "$(jq -r .network /absolute/path/to/fixture.json)" \
   --mount type=bind,src=/absolute/path/to/auth.json,dst=/run/secrets/codex-auth.json,readonly \
   --mount type=bind,src=/absolute/path/to/lane/tea-home,dst=/run/secrets/tea-home,readonly \
   --mount type=bind,src=/absolute/path/to/lane/repo,dst=/workspace \
-  agent-skills-codex-benchmark:0.147.0 \
+  agent-skills-codex-benchmark:0.172.0 \
   --model MODEL \
-  --config 'model_reasoning_effort="medium"' \
   'PROMPT'
 ```
 
-Replace the tmpfs UID and GID when the image was built with different IDs.
+Add `--config 'model_reasoning_effort="<effort>"'` if you want to override the
+model's default reasoning setting. Replace the tmpfs UID and GID when the image
+was built with different IDs.
 The entrypoint copies `auth.json` and Tea configuration into tmpfs, runs
 `codex exec` with ephemeral sessions and ignored user configuration/rules, and
 emits JSONL events for independent tool-call and token accounting.
